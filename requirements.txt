@@ -1,8 +1,9 @@
-# Scribd Paywall Bypass Downloader Bot — Dependencies
+# Universal Document Downloader Bot — Dependencies
 # Install: pip install -r requirements.txt
 
 python-telegram-bot[ext]>=20.0
 aiohttp>=3.9.0
+aiofiles>=24.1.0
 beautifulsoup4>=4.12.0
 Pillow>=10.0.0
 lxml>=5.0.0
