@@ -1,1233 +1,1628 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Scribd Paywall Bypass Downloader — Telegram Bot (v3.0)
-======================================================
-High-performance async Telegram bot that bypasses the Scribd paywall
-to download documents as PDF, TXT, HTML, or high-res Images (ZIP).
+Universal Document Downloader & Viewer Bot (single-file, production-ready)
+==========================================================================
 
-Features:
-  - Robust page-count extraction via regex + BeautifulSoup (6 strategies)
-  - Multi-engine bypass: direct image scrape → third-party gateways
-  - High-res original image download → PDF compile or ZIP archive
-  - Owner / user authorization system with persistent JSON storage
-  - Real-time progress bars inside Telegram messages
-  - Fully async (aiohttp + asyncio), optimized for Termux
+Dependencies (Python 3.11+):
+    pip install -U python-telegram-bot[ext] aiohttp beautifulsoup4 Pillow aiofiles lxml
 
-Requirements:
-    pip install python-telegram-bot[ext] aiohttp beautifulsoup4 Pillow lxml
+Run:
+    export BOT_TOKEN="123456:ABC..."
+    export OWNER_ID="123456789"
+    python scribd_bot.py
 """
 
+from __future__ import annotations
+
 import asyncio
-import html as html_mod
-import io
+import html
 import json
 import logging
 import os
 import re
+import shutil
+import textwrap
+import time
 import zipfile
-from functools import wraps
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
+from uuid import uuid4
 
+import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# 2) CONFIGURATION
+# =============================================================================
 
-BOT_TOKEN = os.getenv(
-    "BOT_TOKEN", "8674547740:AAHP3wLLo1-0CRLkY7F4bc6xL0JcqPEqrQU"
-)
-OWNER_ID = int(os.getenv("OWNER_ID", "6512242172"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+REQUIRE_AUTH = bool(int(os.getenv("REQUIRE_AUTH", "0")))
 
 DATA_DIR = Path("bot_data")
-USERS_FILE = DATA_DIR / "users.json"
+TEMP_DIR = DATA_DIR / "temp"
+STATE_FILE = DATA_DIR / "state.json"
+LOG_FILE = DATA_DIR / "bot.log"
 
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=120)
-
-BROWSER_HEADERS = {
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=90, connect=20, sock_read=60)
+DEFAULT_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
 }
 
-SCRIBD_URL_RE = re.compile(
-    r"https?://(?:www\.)?scribd\.com/"
-    r"(?:document|doc|book|read|presentation|audiobook)/"
-    r"(\d+)"
-)
+MAX_HTML_BYTES = 4 * 1024 * 1024
+CHUNK_SIZE = 64 * 1024
+RETRY_ATTEMPTS = 3
+HTTP_CONCURRENCY = 8
+IMAGE_DOWNLOAD_CONCURRENCY = 6
+MAX_IMAGES_FOR_PDF = 60
 
-HTML_PARSER = "lxml"
-try:
-    BeautifulSoup("", HTML_PARSER)
-except Exception:
-    HTML_PARSER = "html.parser"
+QUEUE_MAXSIZE = 100
+WORKER_COUNT = 3
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger("ScribdBot")
+RATE_LIMIT_COUNT = 8
+RATE_LIMIT_WINDOW = 30
 
+CACHE_TTL_SECONDS = 600
+CACHE_MAX_ITEMS = 500
+MAX_HISTORY_PER_USER = 100
+HISTORY_PAGE_SIZE = 5
+ASSET_PAGE_SIZE = 6
 
-# ═══════════════════════════════════════════════════════════════════════════
-# USER MANAGER (persistent JSON)
-# ═══════════════════════════════════════════════════════════════════════════
+STATE_MENU = 1
+
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
-class UserManager:
-    def __init__(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self._users: set[int] = set()
-        self._load()
+# =============================================================================
+# 3) HELPER UTILITIES
+# =============================================================================
 
-    def _load(self) -> None:
-        if USERS_FILE.exists():
-            try:
-                data = json.loads(USERS_FILE.read_text())
-                self._users = set(data.get("users", []))
-            except (json.JSONDecodeError, KeyError):
-                self._users = set()
-        if OWNER_ID:
-            self._users.add(OWNER_ID)
-        self._save()
+def utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    def _save(self) -> None:
-        USERS_FILE.write_text(
-            json.dumps({"users": sorted(self._users)}, indent=2)
-        )
 
-    def add(self, uid: int) -> bool:
-        if uid in self._users:
+def human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{num_bytes} B"
+
+
+def safe_filename(name: str, max_len: int = 90) -> str:
+    sanitized = re.sub(r"[^\w\s.-]", "", name, flags=re.ASCII).strip().replace(" ", "_")
+    return (sanitized[:max_len] or "document").strip("._")
+
+
+def trim_url(text: str, max_len: int = 70) -> str:
+    text = text.strip()
+    return text if len(text) <= max_len else f"{text[:max_len]}..."
+
+
+def extract_url(text: str) -> str | None:
+    match = re.search(r"https?://[^\s<>()]+", text)
+    if not match:
+        return None
+    url = match.group(0).rstrip(".,);]>\"'")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return url
+
+
+def action_label(action: str) -> str:
+    labels = {
+        "pdf": "PDF",
+        "images": "Images ZIP",
+        "text": "TXT",
+        "html": "HTML Snapshot",
+    }
+    return labels.get(action, action.upper())
+
+
+def file_ext_from_url(url: str) -> str:
+    path = urlparse(url).path.lower()
+    suffix = Path(path).suffix.lower()
+    return suffix
+
+
+async def rm_tree(path: Path) -> None:
+    if path.exists():
+        await asyncio.to_thread(shutil.rmtree, path, True)
+
+
+async def ensure_dirs() -> None:
+    for p in (DATA_DIR, TEMP_DIR):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+async def cleanup_old_temp(max_age_hours: int = 6) -> None:
+    if not TEMP_DIR.exists():
+        return
+    cutoff = time.time() - (max_age_hours * 3600)
+    for child in TEMP_DIR.iterdir():
+        try:
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                await rm_tree(child)
+        except OSError:
+            continue
+
+
+class RateLimiter:
+    def __init__(self, max_events: int, per_seconds: int) -> None:
+        self.max_events = max_events
+        self.per_seconds = per_seconds
+        self.events: dict[int, deque[float]] = defaultdict(deque)
+
+    def allow(self, user_id: int) -> bool:
+        now = time.monotonic()
+        dq = self.events[user_id]
+        while dq and (now - dq[0]) > self.per_seconds:
+            dq.popleft()
+        if len(dq) >= self.max_events:
             return False
-        self._users.add(uid)
-        self._save()
+        dq.append(now)
         return True
 
-    def remove(self, uid: int) -> bool:
-        if uid == OWNER_ID or uid not in self._users:
-            return False
-        self._users.discard(uid)
-        self._save()
-        return True
 
-    def is_authorized(self, uid: int) -> bool:
-        return uid in self._users
+class TTLCache:
+    def __init__(self, ttl_seconds: int, max_items: int) -> None:
+        self.ttl = ttl_seconds
+        self.max_items = max_items
+        self._store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
 
-    @property
-    def all_ids(self) -> list[int]:
-        return sorted(self._users)
+    def get(self, key: str) -> Any | None:
+        entry = self._store.get(key)
+        if not entry:
+            return None
+        exp, value = entry
+        if exp < time.time():
+            self._store.pop(key, None)
+            return None
+        self._store.move_to_end(key)
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        if key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = (time.time() + self.ttl, value)
+        while len(self._store) > self.max_items:
+            self._store.popitem(last=False)
 
 
-user_mgr = UserManager()
+class StateManager:
+    """Persistent JSON state for users/settings/history/stats."""
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SCRIBD SCRAPER — page-count, images, bypass
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class ScribdScraper:
-    BYPASS_GATEWAYS = [
-        {"name": "DLScrib", "url": "https://dlscrib.com/fetch", "method": "post"},
-        {
-            "name": "DocDownloader",
-            "url": "https://www.docdownloader.com/api/scribd",
-            "method": "post",
-        },
-        {
-            "name": "ScribFree",
-            "url": "https://scribfree.com/download",
-            "method": "get",
-        },
-    ]
-
-    def __init__(self, session: aiohttp.ClientSession) -> None:
-        self.session = session
-
-    # ── HTTP helpers ──────────────────────────────────────────────────────
-
-    async def _get_text(self, url: str, extra_headers: dict | None = None) -> str:
-        hdrs = {**BROWSER_HEADERS, **(extra_headers or {})}
-        async with self.session.get(
-            url,
-            headers=hdrs,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-            ssl=False,
-        ) as r:
-            r.raise_for_status()
-            return await r.text()
-
-    async def _get_bytes(self, url: str, extra_headers: dict | None = None) -> bytes:
-        hdrs = {**BROWSER_HEADERS, **(extra_headers or {})}
-        async with self.session.get(
-            url,
-            headers=hdrs,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-            ssl=False,
-        ) as r:
-            r.raise_for_status()
-            return await r.read()
-
-    # ── Metadata ──────────────────────────────────────────────────────────
-
-    async def get_metadata(self, doc_id: str) -> dict:
-        url = f"https://www.scribd.com/document/{doc_id}"
-        raw_html = await self._get_text(url)
-        soup = BeautifulSoup(raw_html, HTML_PARSER)
-
-        meta: dict = {
-            "doc_id": doc_id,
-            "url": url,
-            "title": "Unknown Document",
-            "author": "Unknown",
-            "description": "",
-            "page_count": 0,
-            "_html": raw_html,
-            "_soup": soup,
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = asyncio.Lock()
+        self.data: dict[str, Any] = {
+            "authorized_users": [],
+            "known_users": [],
+            "settings": {},
+            "history": {},
+            "stats": {},
         }
 
-        og_title = soup.find("meta", property="og:title")
-        if og_title and og_title.get("content"):
-            meta["title"] = og_title["content"]
-        elif soup.title and soup.title.string:
-            meta["title"] = soup.title.string.strip()
-
-        for sel in [
-            soup.find("meta", attrs={"name": "author"}),
-            soup.select_one("a.author-name, span.author, a[href*='/user/']"),
-        ]:
-            if sel:
-                val = sel.get("content") or sel.get_text(strip=True)
-                if val:
-                    meta["author"] = val
-                    break
-
-        og_desc = soup.find("meta", property="og:description")
-        if og_desc and og_desc.get("content"):
-            meta["description"] = og_desc["content"][:300]
-
-        meta["page_count"] = self._extract_page_count(raw_html, soup)
-        return meta
-
-    # ── Page count (6 strategies) ─────────────────────────────────────────
-
-    def _extract_page_count(self, text: str, soup: BeautifulSoup) -> int:
-        for fn in (
-            self._pc_json_parse,
-            self._pc_json_fields,
-            self._pc_page_entities,
-            self._pc_meta_tags,
-            self._pc_ld_json,
-            self._pc_text_patterns,
-        ):
-            try:
-                n = fn(text, soup)
-                if n and n > 0:
-                    logger.info("Page count %d via %s", n, fn.__name__)
-                    return n
-            except Exception:
-                pass
-        return 0
+    @staticmethod
+    def _uid(user_id: int) -> str:
+        return str(user_id)
 
     @staticmethod
-    def _pc_json_parse(text: str, _s: BeautifulSoup) -> int:
-        for m in re.finditer(r"JSON\.parse\(['\"](.+?)['\"]\)", text):
-            try:
-                raw = m.group(1).encode().decode("unicode_escape")
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    for key in (
-                        "page_count", "pageCount", "pages",
-                        "num_pages", "totalPages",
-                    ):
-                        if key in data and int(data[key]) > 0:
-                            return int(data[key])
-                    for v in data.values():
-                        if isinstance(v, dict):
-                            for key in ("page_count", "pageCount"):
-                                if key in v:
-                                    return int(v[key])
-            except Exception:
-                continue
-        return 0
+    def _default_settings() -> dict[str, Any]:
+        return {"preview_enabled": True}
 
     @staticmethod
-    def _pc_json_fields(text: str, _s: BeautifulSoup) -> int:
-        for pat in (
-            r'"page_count"\s*:\s*(\d+)',
-            r'"pageCount"\s*:\s*(\d+)',
-            r'"num_pages"\s*:\s*(\d+)',
-            r'"total_pages"\s*:\s*(\d+)',
-            r'"totalPages"\s*:\s*(\d+)',
-            r"'page_count'\s*:\s*(\d+)",
-            r'"contentPages"\s*:\s*(\d+)',
-        ):
-            m = re.search(pat, text)
-            if m:
-                return int(m.group(1))
-        return 0
+    def _default_stats() -> dict[str, int]:
+        return {
+            "requests": 0,
+            "downloads": 0,
+            "errors": 0,
+            "pdf": 0,
+            "images": 0,
+            "text": 0,
+            "html": 0,
+            "bytes_sent": 0,
+        }
 
-    @staticmethod
-    def _pc_page_entities(text: str, soup: BeautifulSoup) -> int:
-        elems = soup.find_all(
-            class_=re.compile(r"js.page.entity|page_entity|page-entity", re.I)
-        )
-        if elems:
-            return len(elems)
-        divs = soup.find_all("div", attrs={"data-page": True})
-        if divs:
-            return len(divs)
-        nums = re.findall(r'data-page-number="(\d+)"', text)
-        if nums:
-            return max(int(n) for n in nums)
-        return 0
-
-    @staticmethod
-    def _pc_meta_tags(_t: str, soup: BeautifulSoup) -> int:
-        for tag in soup.find_all("meta"):
-            name = (tag.get("name", "") or tag.get("property", "")).lower()
-            if "page" in name and "count" in name:
-                try:
-                    return int(tag["content"])
-                except (ValueError, KeyError):
-                    pass
-        return 0
-
-    @staticmethod
-    def _pc_ld_json(_t: str, soup: BeautifulSoup) -> int:
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if isinstance(item, dict):
-                        for key in ("numberOfPages", "pageCount", "page_count"):
-                            if key in item:
-                                return int(item[key])
-            except Exception:
-                continue
-        return 0
-
-    @staticmethod
-    def _pc_text_patterns(text: str, _s: BeautifulSoup) -> int:
-        for pat in (
-            r"(\d+)\s+(?:pages?|Pages?|PAGES)",
-            r"(?:pages?|Pages?)\s*:\s*(\d+)",
-            r"of\s+(\d+)\s+pages",
-        ):
-            m = re.search(pat, text)
-            if m:
-                val = int(m.group(1))
-                if 1 < val < 10_000:
-                    return val
-        return 0
-
-    # ── Image URL extraction ──────────────────────────────────────────────
-
-    async def extract_image_urls(self, meta: dict) -> list[str]:
-        raw = meta["_html"]
-        soup = meta["_soup"]
-        doc_id = meta["doc_id"]
-        urls: list[str] = []
-
-        cdn_pats = [
-            re.compile(
-                r"(https?://html\d*\.scribdassets\.com/"
-                r'[a-zA-Z0-9_-]+/images/[^"\'\\\s<>]+\.'
-                r"(?:jpg|png|webp))",
-                re.I,
-            ),
-            re.compile(
-                r"(https?://imgv2-\d+-shm-\w+\.scribdassets\.com/"
-                r'img/[^"\'\\\s<>]+)',
-                re.I,
-            ),
-            re.compile(
-                r"(https?://[^\s\"'<>]*scribdassets\.com"
-                r'[^\s"\'<>]*\.(?:jpg|png|webp))',
-                re.I,
-            ),
-        ]
-        seen: set[str] = set()
-        for pat in cdn_pats:
-            for m in pat.finditer(raw):
-                u = m.group(1).split("?")[0]
-                if u not in seen:
-                    seen.add(u)
-                    urls.append(u)
-
-        if not urls:
-            urls = self._images_from_json(raw)
-
-        if not urls:
-            urls = await self._images_from_read_api(doc_id, raw)
-
-        if not urls and meta["page_count"] > 0:
-            urls = await self._probe_cdn(raw, meta["page_count"])
-
-        urls = list(dict.fromkeys(self._upscale(u) for u in urls))
-        return urls
-
-    @staticmethod
-    def _upscale(url: str) -> str:
-        url = re.sub(r"/\d+x\d+/", "/original/", url)
-        url = re.sub(r"[?&]w=\d+", "", url)
-        url = re.sub(r"[?&]h=\d+", "", url)
-        url = re.sub(r"-\d+x\d+\.", ".", url)
-        return url
-
-    @staticmethod
-    def _images_from_json(text: str) -> list[str]:
-        urls: list[str] = []
-
-        def _walk(obj: object, depth: int = 0) -> None:
-            if depth > 5:
-                return
-            if isinstance(obj, dict):
-                for v in obj.values():
-                    if (
-                        isinstance(v, str)
-                        and "scribdassets.com" in v
-                        and any(v.lower().endswith(e) for e in (".jpg", ".png", ".webp"))
-                    ):
-                        urls.append(v.split("?")[0])
-                    else:
-                        _walk(v, depth + 1)
-            elif isinstance(obj, list):
-                for item in obj:
-                    _walk(item, depth + 1)
-
-        for block in re.findall(r"\{[^{}]{100,}\}", text)[:50]:
-            try:
-                _walk(json.loads(block))
-            except Exception:
-                pass
-        return urls
-
-    async def _images_from_read_api(self, doc_id: str, text: str) -> list[str]:
-        ak = re.search(r'"access_key"\s*:\s*"([^"]+)"', text)
-        if not ak:
-            return []
-        api = (
-            f"https://www.scribd.com/doc-page/read-data"
-            f"?doc_id={doc_id}&access_key={ak.group(1)}"
-        )
-        urls: list[str] = []
+    async def load(self) -> None:
+        await ensure_dirs()
+        if not self.path.exists():
+            await self._ensure_owner_and_save()
+            return
         try:
-            resp = await self._get_text(
-                api,
-                extra_headers={
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"https://www.scribd.com/document/{doc_id}",
-                },
-            )
-            self._images_from_json.__func__(resp)  # type: ignore[attr-defined]
+            async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
+                raw = await f.read()
+            loaded = json.loads(raw) if raw.strip() else {}
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
         except Exception:
-            pass
-        return urls
+            logging.exception("Failed to load state file, using defaults.")
+        await self._ensure_owner_and_save()
 
-    async def _probe_cdn(self, text: str, page_count: int) -> list[str]:
-        base_m = re.search(r"scribdassets\.com/([a-zA-Z0-9_-]{10,})/", text)
-        if not base_m:
-            return []
-        base = f"https://html.scribdassets.com/{base_m.group(1)}/images"
-        templates = ["{base}/{num:04d}.jpg", "{base}/page-{num}.jpg"]
-        for tmpl in templates:
-            test = tmpl.format(base=base, num=1)
+    async def _ensure_owner_and_save(self) -> None:
+        async with self.lock:
+            users = set(map(int, self.data.get("authorized_users", [])))
+            users.add(OWNER_ID)
+            self.data["authorized_users"] = sorted(users)
+            known = set(map(int, self.data.get("known_users", [])))
+            known.add(OWNER_ID)
+            self.data["known_users"] = sorted(known)
+            await self._save_locked()
+
+    async def _save_locked(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(self.data, ensure_ascii=False, indent=2))
+        await asyncio.to_thread(tmp.replace, self.path)
+
+    async def touch_user(self, user_id: int) -> None:
+        async with self.lock:
+            known = set(map(int, self.data.get("known_users", [])))
+            if user_id not in known:
+                known.add(user_id)
+                self.data["known_users"] = sorted(known)
+            uid = self._uid(user_id)
+            self.data.setdefault("settings", {}).setdefault(uid, self._default_settings())
+            self.data.setdefault("history", {}).setdefault(uid, [])
+            self.data.setdefault("stats", {}).setdefault(uid, self._default_stats())
+            await self._save_locked()
+
+    async def is_allowed(self, user_id: int) -> bool:
+        if user_id == OWNER_ID:
+            return True
+        if not REQUIRE_AUTH:
+            return True
+        async with self.lock:
+            return user_id in set(map(int, self.data.get("authorized_users", [])))
+
+    async def add_user(self, user_id: int) -> bool:
+        async with self.lock:
+            users = set(map(int, self.data.get("authorized_users", [])))
+            if user_id in users:
+                return False
+            users.add(user_id)
+            self.data["authorized_users"] = sorted(users)
+            await self._save_locked()
+            return True
+
+    async def remove_user(self, user_id: int) -> bool:
+        if user_id == OWNER_ID:
+            return False
+        async with self.lock:
+            users = set(map(int, self.data.get("authorized_users", [])))
+            if user_id not in users:
+                return False
+            users.remove(user_id)
+            self.data["authorized_users"] = sorted(users)
+            await self._save_locked()
+            return True
+
+    async def authorized_users(self) -> list[int]:
+        async with self.lock:
+            return sorted(map(int, self.data.get("authorized_users", [])))
+
+    async def known_users(self) -> list[int]:
+        async with self.lock:
+            return sorted(map(int, self.data.get("known_users", [])))
+
+    async def get_setting(self, user_id: int, key: str, default: Any = None) -> Any:
+        uid = self._uid(user_id)
+        async with self.lock:
+            return self.data.get("settings", {}).get(uid, {}).get(key, default)
+
+    async def toggle_preview(self, user_id: int) -> bool:
+        uid = self._uid(user_id)
+        async with self.lock:
+            settings = self.data.setdefault("settings", {}).setdefault(uid, self._default_settings())
+            settings["preview_enabled"] = not bool(settings.get("preview_enabled", True))
+            await self._save_locked()
+            return settings["preview_enabled"]
+
+    async def add_history(self, user_id: int, entry: dict[str, Any]) -> None:
+        uid = self._uid(user_id)
+        async with self.lock:
+            hist = self.data.setdefault("history", {}).setdefault(uid, [])
+            hist.insert(0, entry)
+            if len(hist) > MAX_HISTORY_PER_USER:
+                del hist[MAX_HISTORY_PER_USER:]
+            await self._save_locked()
+
+    async def history_page(self, user_id: int, page: int, per_page: int) -> tuple[list[dict[str, Any]], int]:
+        uid = self._uid(user_id)
+        async with self.lock:
+            hist = list(self.data.get("history", {}).get(uid, []))
+        if not hist:
+            return [], 1
+        total_pages = (len(hist) + per_page - 1) // per_page
+        page = max(0, min(page, total_pages - 1))
+        start = page * per_page
+        return hist[start : start + per_page], total_pages
+
+    async def bump_stats(
+        self,
+        user_id: int,
+        *,
+        request: bool = False,
+        action: str | None = None,
+        success: bool | None = None,
+        bytes_sent: int = 0,
+    ) -> None:
+        uid = self._uid(user_id)
+        async with self.lock:
+            stats = self.data.setdefault("stats", {}).setdefault(uid, self._default_stats())
+            if request:
+                stats["requests"] += 1
+            if action in {"pdf", "images", "text", "html"}:
+                stats[action] += 1
+            if success is True:
+                stats["downloads"] += 1
+            elif success is False:
+                stats["errors"] += 1
+            if bytes_sent > 0:
+                stats["bytes_sent"] += int(bytes_sent)
+            await self._save_locked()
+
+    async def user_stats(self, user_id: int) -> dict[str, int]:
+        uid = self._uid(user_id)
+        async with self.lock:
+            return dict(self.data.get("stats", {}).get(uid, self._default_stats()))
+
+
+async def safe_edit_status(
+    bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as exc:
+        if "Message is not modified" not in str(exc):
+            logging.debug("safe_edit_status BadRequest: %s", exc)
+    except Exception:
+        logging.exception("safe_edit_status failed")
+
+
+class ProgressReporter:
+    """Throttle message edits for progress updates."""
+
+    def __init__(self, min_interval: float = 1.2) -> None:
+        self.min_interval = min_interval
+        self.last = 0.0
+
+    def should_report(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if force or (now - self.last) >= self.min_interval:
+            self.last = now
+            return True
+        return False
+
+
+# =============================================================================
+# 4) DOWNLOADER ENGINE
+# =============================================================================
+
+class DownloaderEngine:
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self.session = session
+        self.sem = asyncio.Semaphore(HTTP_CONCURRENCY)
+
+    async def fetch_page(self, url: str) -> tuple[str, str, str]:
+        """Fetch a URL; returns (text, final_url, content_type)."""
+        last_exc: Exception | None = None
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                async with self.session.head(
-                    test,
-                    headers=BROWSER_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                    allow_redirects=True,
-                    ssl=False,
-                ) as r:
-                    if r.status == 200:
-                        return [
-                            tmpl.format(base=base, num=p)
-                            for p in range(1, page_count + 1)
-                        ]
-            except Exception:
-                pass
-        return []
+                async with self.sem:
+                    async with self.session.get(
+                        url,
+                        timeout=REQUEST_TIMEOUT,
+                        headers=DEFAULT_HEADERS,
+                        allow_redirects=True,
+                    ) as resp:
+                        resp.raise_for_status()
+                        final_url = str(resp.url)
+                        content_type = resp.headers.get("Content-Type", "").lower()
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                            total += len(chunk)
+                            if total > MAX_HTML_BYTES:
+                                break
+                            chunks.append(chunk)
+                        raw = b"".join(chunks)
+                        charset = resp.charset or "utf-8"
+                        text = raw.decode(charset, errors="ignore")
+                        return text, final_url, content_type
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                await asyncio.sleep(0.6 * attempt)
+        raise RuntimeError(f"Failed to fetch URL after retries: {last_exc}")
 
-    # ── Download page images concurrently ─────────────────────────────────
+    async def stream_to_file(
+        self,
+        url: str,
+        output_path: Path,
+        *,
+        progress_cb=None,
+    ) -> int:
+        """Stream download to file asynchronously with retries."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        last_exc: Exception | None = None
+
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            downloaded = 0
+            try:
+                async with self.sem:
+                    async with self.session.get(
+                        url,
+                        timeout=REQUEST_TIMEOUT,
+                        headers=DEFAULT_HEADERS,
+                        allow_redirects=True,
+                    ) as resp:
+                        resp.raise_for_status()
+                        total = int(resp.headers.get("Content-Length", "0") or "0")
+                        async with aiofiles.open(output_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                                downloaded += len(chunk)
+                                await f.write(chunk)
+                                if progress_cb:
+                                    await progress_cb(downloaded, total)
+                        return downloaded
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_exc = exc
+                await asyncio.sleep(0.8 * attempt)
+        raise RuntimeError(f"Download failed for {url}: {last_exc}")
 
     async def download_images(
-        self, urls: list[str], progress_cb=None
-    ) -> list[bytes]:
-        sem = asyncio.Semaphore(6)
-        results: list[tuple[int, bytes | None]] = []
+        self,
+        image_urls: list[str],
+        target_dir: Path,
+        *,
+        progress_cb=None,
+    ) -> list[Path]:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        sem = asyncio.Semaphore(IMAGE_DOWNLOAD_CONCURRENCY)
+        completed = 0
+        lock = asyncio.Lock()
+        out_paths: list[Path | None] = [None] * len(image_urls)
 
-        async def _grab(idx: int, url: str) -> None:
+        async def _one(idx: int, image_url: str) -> None:
+            nonlocal completed
+            suffix = file_ext_from_url(image_url)
+            if suffix not in ALLOWED_IMAGE_EXT:
+                suffix = ".jpg"
+            out = target_dir / f"img_{idx + 1:04d}{suffix}"
             async with sem:
-                for attempt in range(3):
-                    try:
-                        data = await self._get_bytes(
-                            url, extra_headers={"Referer": "https://www.scribd.com/"}
-                        )
-                        if len(data) > 500:
-                            results.append((idx, data))
-                            if progress_cb:
-                                await progress_cb(idx + 1, len(urls))
-                            return
-                    except Exception:
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                results.append((idx, None))
-
-        await asyncio.gather(*(_grab(i, u) for i, u in enumerate(urls)))
-        results.sort(key=lambda x: x[0])
-        return [d for _, d in results if d]
-
-    # ── Conversions ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def images_to_pdf(blobs: list[bytes]) -> bytes:
-        imgs: list[Image.Image] = []
-        for b in blobs:
-            try:
-                im = Image.open(io.BytesIO(b))
-                if im.mode in ("RGBA", "P", "LA"):
-                    im = im.convert("RGB")
-                imgs.append(im)
-            except Exception:
-                pass
-        if not imgs:
-            raise ValueError("No valid images to create PDF")
-        buf = io.BytesIO()
-        first, *rest = imgs
-        first.save(buf, "PDF", save_all=True, append_images=rest, resolution=150)
-        return buf.getvalue()
-
-    @staticmethod
-    def images_to_zip(blobs: list[bytes], title: str = "document") -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for idx, data in enumerate(blobs, 1):
-                ext = "png" if data[:4] == b"\x89PNG" else "jpg"
-                zf.writestr(f"{title}_page_{idx:04d}.{ext}", data)
-        return buf.getvalue()
-
-    # ── Text / HTML extraction ────────────────────────────────────────────
-
-    async def extract_text(self, meta: dict) -> str:
-        soup: BeautifulSoup = meta["_soup"]
-        parts: list[str] = []
-
-        for cls_re in (
-            r"text_layer|text-layer|page_text",
-            r"page_content|doc_page|reader_page|page_inner",
-        ):
-            for el in soup.find_all(class_=re.compile(cls_re, re.I)):
-                t = el.get_text("\n", strip=True)
-                if t and len(t) > 20:
-                    parts.append(t)
-            if parts:
-                break
-
-        if not parts:
-            parts = self._text_from_json(meta["_html"])
-
-        if not parts:
-            for sel in ("article", "main", ".document_content", "#document_column"):
-                el = soup.select_one(sel)
-                if el:
-                    t = el.get_text("\n", strip=True)
-                    if len(t) > 50:
-                        parts.append(t)
-                        break
-
-        return "\n\n--- Page Break ---\n\n".join(parts) if parts else ""
-
-    @staticmethod
-    def _text_from_json(text: str) -> list[str]:
-        out: list[str] = []
-        for pat in (
-            r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
-            r'"page_text"\s*:\s*"((?:[^"\\]|\\.)*)"',
-            r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"',
-        ):
-            for m in re.finditer(pat, text):
                 try:
-                    decoded = m.group(1).encode().decode("unicode_escape")
-                    cleaned = re.sub(r"<[^>]+>", "", decoded).strip()
-                    if len(cleaned) > 30:
-                        out.append(cleaned)
+                    await self.stream_to_file(image_url, out)
+                    out_paths[idx] = out
                 except Exception:
-                    pass
+                    logging.warning("Image download failed: %s", image_url)
+            async with lock:
+                completed += 1
+                if progress_cb:
+                    await progress_cb(completed, len(image_urls))
+
+        await asyncio.gather(*(_one(i, u) for i, u in enumerate(image_urls)))
+        return [p for p in out_paths if p]
+
+    async def images_to_pdf(self, image_paths: list[Path], out_pdf: Path) -> int:
+        def _convert() -> int:
+            opened: list[Image.Image] = []
+            rgb_images: list[Image.Image] = []
+            try:
+                for path in image_paths[:MAX_IMAGES_FOR_PDF]:
+                    img = Image.open(path)
+                    opened.append(img)
+                    if max(img.size) > 2600:
+                        img.thumbnail((2600, 2600), Image.Resampling.LANCZOS)
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    rgb_images.append(img)
+                if not rgb_images:
+                    raise ValueError("No valid images available for PDF conversion")
+                first, *rest = rgb_images
+                first.save(out_pdf, "PDF", resolution=150.0, save_all=True, append_images=rest)
+                return out_pdf.stat().st_size
+            finally:
+                for img in opened:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+                for img in rgb_images:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+
+        return await asyncio.to_thread(_convert)
+
+    async def text_to_pdf(self, text: str, title: str, out_pdf: Path) -> int:
+        def _render() -> int:
+            font = ImageFont.load_default()
+            page_w, page_h = 1240, 1754
+            margin = 70
+            line_h = 22
+            max_chars = 95
+
+            lines: list[str] = [title, "-" * min(len(title), 80), ""]
+            for paragraph in text.splitlines():
+                para = paragraph.strip()
+                if not para:
+                    lines.append("")
+                    continue
+                lines.extend(textwrap.wrap(para, width=max_chars))
+
+            pages: list[Image.Image] = []
+            page = Image.new("RGB", (page_w, page_h), "white")
+            draw = ImageDraw.Draw(page)
+            y = margin
+
+            for line in lines:
+                if y + line_h > page_h - margin:
+                    pages.append(page)
+                    page = Image.new("RGB", (page_w, page_h), "white")
+                    draw = ImageDraw.Draw(page)
+                    y = margin
+                draw.text((margin, y), line, fill="black", font=font)
+                y += line_h
+            pages.append(page)
+
+            first, *rest = pages
+            first.save(out_pdf, "PDF", resolution=150.0, save_all=True, append_images=rest)
+            for p in pages:
+                p.close()
+            return out_pdf.stat().st_size
+
+        return await asyncio.to_thread(_render)
+
+    async def make_zip(self, files: list[Path], out_zip: Path) -> int:
+        def _zip() -> int:
+            with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for fp in files:
+                    if fp.exists():
+                        zf.write(fp, arcname=fp.name)
+            return out_zip.stat().st_size
+
+        return await asyncio.to_thread(_zip)
+
+    async def write_text(self, content: str, out_file: Path) -> int:
+        async with aiofiles.open(out_file, "w", encoding="utf-8") as f:
+            await f.write(content)
+        return out_file.stat().st_size
+
+    async def write_html(self, content: str, out_file: Path) -> int:
+        async with aiofiles.open(out_file, "w", encoding="utf-8") as f:
+            await f.write(content)
+        return out_file.stat().st_size
+
+
+# =============================================================================
+# 5) PARSER ENGINE
+# =============================================================================
+
+@dataclass(slots=True)
+class AssetLink:
+    kind: str
+    url: str
+    source: str
+
+
+@dataclass(slots=True)
+class ParsedPage:
+    requested_url: str
+    final_url: str
+    title: str
+    content_type: str
+    html_content: str
+    text_content: str
+    excerpt: str
+    assets: list[AssetLink]
+    pdf_links: list[str]
+    image_links: list[str]
+    docx_links: list[str]
+    txt_links: list[str]
+
+
+class ParserEngine:
+    def __init__(self, downloader: DownloaderEngine, cache: TTLCache) -> None:
+        self.downloader = downloader
+        self.cache = cache
+
+    @staticmethod
+    def _classify_url(candidate: str) -> str:
+        low = candidate.lower()
+        suffix = file_ext_from_url(candidate)
+        if suffix == ".pdf" or "application/pdf" in low:
+            return "pdf"
+        if suffix in ALLOWED_IMAGE_EXT:
+            return "image"
+        if suffix == ".docx":
+            return "docx"
+        if suffix == ".txt":
+            return "txt"
+        if suffix in {".html", ".htm"}:
+            return "html"
+        return "other"
+
+    @staticmethod
+    def _normalize_assets(assets: list[AssetLink]) -> list[AssetLink]:
+        seen: set[str] = set()
+        out: list[AssetLink] = []
+        for asset in assets:
+            u = asset.url.split("#")[0]
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(AssetLink(kind=asset.kind, url=u, source=asset.source))
         return out
 
-    async def build_html(self, meta: dict) -> str:
-        title = html_mod.escape(meta["title"])
-        author = html_mod.escape(meta["author"])
-        raw_text = await self.extract_text(meta)
-        body = ""
-        if raw_text:
-            for block in raw_text.split("\n\n--- Page Break ---\n\n"):
-                body += "<div class='page'>\n"
-                for line in block.strip().splitlines():
-                    if line.strip():
-                        body += f"  <p>{html_mod.escape(line.strip())}</p>\n"
-                body += "</div>\n<hr>\n"
-        else:
-            body = (
-                "<p><em>Text could not be extracted from this document. "
-                "Try the PDF or Images format instead.</em></p>"
-            )
+    async def parse(self, url: str) -> ParsedPage:
+        cached = self.cache.get(url)
+        if cached:
+            return cached
 
-        return (
-            "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
-            "  <meta charset='UTF-8'>\n"
-            "  <meta name='viewport' content='width=device-width,initial-scale=1'>\n"
-            f"  <title>{title}</title>\n"
-            "  <style>\n"
-            "    body{font-family:Georgia,serif;max-width:800px;margin:2rem auto;"
-            "padding:0 1rem;line-height:1.8;color:#222}\n"
-            "    h1{font-size:1.8rem;border-bottom:2px solid #333;padding-bottom:.5rem}\n"
-            "    .meta{color:#666;font-style:italic;margin-bottom:2rem}\n"
-            "    .page{margin:1.5rem 0} hr{border:none;border-top:1px solid #ddd;"
-            "margin:2rem 0}\n"
-            "    p{margin:.5rem 0;text-align:justify}\n"
-            "  </style>\n</head>\n<body>\n"
-            f"  <h1>{title}</h1>\n"
-            f"  <div class='meta'>Author: {author} | "
-            f"Pages: {meta['page_count']}</div>\n"
-            f"  {body}\n"
-            "</body>\n</html>"
+        suffix = file_ext_from_url(url)
+        if suffix in {".pdf", ".docx", ".txt"} | ALLOWED_IMAGE_EXT:
+            direct_kind = self._classify_url(url)
+            assets = [AssetLink(kind=direct_kind, url=url, source="direct")]
+            parsed = ParsedPage(
+                requested_url=url,
+                final_url=url,
+                title=safe_filename(Path(urlparse(url).path).stem or "document"),
+                content_type="application/octet-stream",
+                html_content="",
+                text_content="",
+                excerpt="Direct file URL detected.",
+                assets=assets,
+                pdf_links=[url] if direct_kind == "pdf" else [],
+                image_links=[url] if direct_kind == "image" else [],
+                docx_links=[url] if direct_kind == "docx" else [],
+                txt_links=[url] if direct_kind == "txt" else [],
+            )
+            self.cache.set(url, parsed)
+            return parsed
+
+        page_text, final_url, content_type = await self.downloader.fetch_page(url)
+        low_ct = content_type.lower()
+
+        # Handle non-HTML resources while still supporting public direct links.
+        if "html" not in low_ct and not page_text.lstrip().startswith("<"):
+            kind = "other"
+            if "pdf" in low_ct:
+                kind = "pdf"
+            elif "image" in low_ct:
+                kind = "image"
+            elif "word" in low_ct or "docx" in low_ct:
+                kind = "docx"
+            elif "text/plain" in low_ct:
+                kind = "txt"
+            assets = [AssetLink(kind=kind, url=final_url, source="content-type")]
+            parsed = ParsedPage(
+                requested_url=url,
+                final_url=final_url,
+                title=safe_filename(Path(urlparse(final_url).path).stem or "document"),
+                content_type=content_type,
+                html_content="",
+                text_content=page_text[:10000] if kind == "txt" else "",
+                excerpt="Direct downloadable resource detected.",
+                assets=assets,
+                pdf_links=[final_url] if kind == "pdf" else [],
+                image_links=[final_url] if kind == "image" else [],
+                docx_links=[final_url] if kind == "docx" else [],
+                txt_links=[final_url] if kind == "txt" else [],
+            )
+            self.cache.set(url, parsed)
+            return parsed
+
+        soup = BeautifulSoup(page_text, "lxml")
+        title = "Untitled Page"
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+        elif (og := soup.find("meta", property="og:title")) and og.get("content"):
+            title = str(og["content"]).strip()
+
+        assets: list[AssetLink] = []
+
+        def add_asset(raw_url: str | None, source: str) -> None:
+            if not raw_url:
+                return
+            absolute = urljoin(final_url, raw_url.strip())
+            parsed_abs = urlparse(absolute)
+            if parsed_abs.scheme not in {"http", "https"} or not parsed_abs.netloc:
+                return
+            kind = self._classify_url(absolute)
+            assets.append(AssetLink(kind=kind, url=absolute, source=source))
+
+        for tag in soup.select("a[href]"):
+            add_asset(tag.get("href"), "a[href]")
+        for tag in soup.select("img[src], img[data-src], source[src]"):
+            add_asset(tag.get("src") or tag.get("data-src"), tag.name)
+        for tag in soup.select("iframe[src], embed[src], object[data]"):
+            add_asset(tag.get("src") or tag.get("data"), tag.name)
+
+        assets = self._normalize_assets(assets)
+
+        # Extract readable text from webpage.
+        for bad in soup(["script", "style", "noscript"]):
+            bad.decompose()
+        text_content = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True)).strip()
+        excerpt = text_content[:400] + ("..." if len(text_content) > 400 else "")
+
+        pdf_links = [a.url for a in assets if a.kind == "pdf"]
+        image_links = [a.url for a in assets if a.kind == "image"]
+        docx_links = [a.url for a in assets if a.kind == "docx"]
+        txt_links = [a.url for a in assets if a.kind == "txt"]
+
+        parsed = ParsedPage(
+            requested_url=url,
+            final_url=final_url,
+            title=title[:200] or "Untitled Page",
+            content_type=content_type,
+            html_content=page_text,
+            text_content=text_content,
+            excerpt=excerpt,
+            assets=assets,
+            pdf_links=pdf_links,
+            image_links=image_links,
+            docx_links=docx_links,
+            txt_links=txt_links,
+        )
+        self.cache.set(url, parsed)
+        return parsed
+
+
+# =============================================================================
+# 6) TELEGRAM HANDLERS
+# =============================================================================
+
+@dataclass(slots=True)
+class DownloadJob:
+    user_id: int
+    chat_id: int
+    status_message_id: int
+    url: str
+    action: str
+    future: asyncio.Future
+
+
+def kb_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📥 Download Document", callback_data="menu:download")],
+            [InlineKeyboardButton("📂 My Downloads", callback_data="menu:my")],
+            [InlineKeyboardButton("📚 Extract Text", callback_data="menu:extract")],
+            [InlineKeyboardButton("🌐 Website Snapshot", callback_data="menu:snapshot")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="menu:settings")],
+            [InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")],
+        ]
+    )
+
+
+def kb_link_actions(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("⬇ Download as PDF", callback_data="action:pdf"),
+            InlineKeyboardButton("🖼 Download Images", callback_data="action:images"),
+        ],
+        [
+            InlineKeyboardButton("📄 Extract Text", callback_data="action:text"),
+            InlineKeyboardButton("🌐 Save HTML", callback_data="action:html"),
+        ],
+    ]
+    if total_pages > 1:
+        rows.append(
+            [
+                InlineKeyboardButton("⬅ Prev Page", callback_data="asset:prev"),
+                InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="asset:noop"),
+                InlineKeyboardButton("➡ Next Page", callback_data="asset:next"),
+            ]
+        )
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_history(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    if total_pages > 1:
+        rows.append(
+            [
+                InlineKeyboardButton("⬅ Prev Page", callback_data=f"hist:{max(0, page - 1)}"),
+                InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="hist:noop"),
+                InlineKeyboardButton(
+                    "➡ Next Page", callback_data=f"hist:{min(total_pages - 1, page + 1)}"
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_settings(preview_enabled: bool) -> InlineKeyboardMarkup:
+    status = "ON ✅" if preview_enabled else "OFF ❌"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Link Preview: {status}",
+                    callback_data="settings:toggle_preview",
+                )
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu:back")],
+        ]
+    )
+
+
+def render_asset_page(parsed: ParsedPage, page: int) -> tuple[str, int]:
+    total_assets = len(parsed.assets)
+    total_pages = max(1, (total_assets + ASSET_PAGE_SIZE - 1) // ASSET_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ASSET_PAGE_SIZE
+    items = parsed.assets[start : start + ASSET_PAGE_SIZE]
+
+    lines = []
+    for idx, asset in enumerate(items, start=start + 1):
+        lines.append(
+            f"{idx}. <b>{asset.kind.upper()}</b> • "
+            f"<code>{html.escape(trim_url(asset.url, 75))}</code>"
+        )
+    assets_block = "\n".join(lines) if lines else "No downloadable assets detected."
+
+    text = (
+        "⚡ <b>Processing link</b>\n\n"
+        f"🔗 <code>{html.escape(trim_url(parsed.final_url, 80))}</code>\n"
+        f"📰 <b>{html.escape(parsed.title)}</b>\n"
+        f"📄 PDFs: <b>{len(parsed.pdf_links)}</b> | "
+        f"🖼 Images: <b>{len(parsed.image_links)}</b> | "
+        f"📎 DOCX: <b>{len(parsed.docx_links)}</b>\n\n"
+        f"{assets_block}\n\n"
+        "Choose output format below:"
+    )
+    return text, total_pages
+
+
+async def render_history_message(
+    user_id: int,
+    state: StateManager,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items, total_pages = await state.history_page(user_id, page, HISTORY_PAGE_SIZE)
+    if not items:
+        text = (
+            "📂 <b>My Downloads</b>\n\n"
+            "No history yet. Send a URL first from the main menu."
+        )
+        return text, kb_history(0, 1)
+
+    lines = [f"📂 <b>My Downloads</b> (page {page + 1}/{total_pages})\n"]
+    for item in items:
+        ts = item.get("timestamp", "")[:19].replace("T", " ")
+        lines.append(
+            f"• <b>{html.escape(item.get('title', 'Untitled'))}</b>\n"
+            f"  {action_label(item.get('action', '?'))} | "
+            f"{item.get('status', 'unknown')} | "
+            f"{human_size(int(item.get('size_bytes', 0)))}\n"
+            f"  <code>{html.escape(trim_url(item.get('url', ''), 65))}</code>\n"
+            f"  <i>{html.escape(ts)}</i>"
+        )
+    return "\n\n".join(lines), kb_history(page, total_pages)
+
+
+async def ensure_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    state: StateManager = context.application.bot_data["state"]
+    user = update.effective_user
+    if not user:
+        return False
+    await state.touch_user(user.id)
+    if await state.is_allowed(user.id):
+        return True
+
+    text = (
+        "❌ <b>Access denied</b>\n\n"
+        "You are not authorized to use this bot.\n"
+        f"Send your ID to owner: <code>{user.id}</code>"
+    )
+    if update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    elif update.callback_query:
+        await update.callback_query.answer("Access denied", show_alert=True)
+    return False
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_access(update, context):
+        return ConversationHandler.END
+    user = update.effective_user
+    await update.effective_message.reply_text(
+        (
+            f"🚀 <b>Universal Document Downloader & Viewer</b>\n\n"
+            f"Hello, {html.escape(user.first_name)}!\n"
+            "Send any public webpage/document URL.\n"
+            "I can detect downloadable assets and export as PDF/ZIP/TXT/HTML.\n\n"
+            "Use the menu below:"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_main_menu(),
+        disable_web_page_preview=True,
+    )
+    return STATE_MENU
+
+
+async def cmd_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        (
+            "ℹ️ <b>Help</b>\n\n"
+            "1) Open <b>📥 Download Document</b>\n"
+            "2) Send a public URL\n"
+            "3) Choose output:\n"
+            "   • ⬇ Download as PDF\n"
+            "   • 🖼 Download Images (ZIP)\n"
+            "   • 📄 Extract Text (TXT)\n"
+            "   • 🌐 Save HTML snapshot\n\n"
+            "Commands:\n"
+            "/start /help /cancel\n"
+            "/add_user /remove_user /users /broadcast (owner only)"
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text(
+        "Operation canceled. Returning to main menu.",
+        reply_markup=kb_main_menu(),
+    )
+    return STATE_MENU
+
+
+async def _analyze_and_show_options(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+) -> None:
+    parser: ParserEngine = context.application.bot_data["parser"]
+    state: StateManager = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+
+    await state.bump_stats(user_id, request=True)
+    status = await update.effective_message.reply_text(
+        "⚡ Processing link\n\nAnalyzing page and detecting assets...",
+        disable_web_page_preview=True,
+    )
+    parsed = await parser.parse(url)
+    context.user_data["current_url"] = url
+    context.user_data["asset_page"] = 0
+
+    show_preview = bool(await state.get_setting(user_id, "preview_enabled", True))
+    msg, total_pages = render_asset_page(parsed, 0)
+    if not show_preview:
+        msg = (
+            "⚡ <b>Processing link</b>\n\n"
+            f"📰 <b>{html.escape(parsed.title)}</b>\n"
+            f"🔗 <code>{html.escape(trim_url(parsed.final_url, 80))}</code>\n\n"
+            "Link preview is disabled in settings.\n"
+            "Choose output format:"
+        )
+        total_pages = 1
+
+    await status.edit_text(
+        msg,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=kb_link_actions(0, total_pages),
+    )
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_access(update, context):
+        return STATE_MENU
+    user_id = update.effective_user.id
+    limiter: RateLimiter = context.application.bot_data["rate_limiter"]
+
+    if not limiter.allow(user_id):
+        await update.message.reply_text(
+            "⏳ Anti-spam active. Please slow down and try again in a few seconds."
+        )
+        return STATE_MENU
+
+    url = extract_url(update.message.text or "")
+    if not url:
+        await update.message.reply_text(
+            "Send a valid public URL (http/https) or use /help.",
+            reply_markup=kb_main_menu(),
+        )
+        return STATE_MENU
+
+    try:
+        await _analyze_and_show_options(update, context, url)
+    except Exception as exc:
+        logging.exception("URL analyze failed")
+        await update.message.reply_text(
+            f"❌ Error while analyzing URL:\n<code>{html.escape(str(exc)[:250])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    return STATE_MENU
+
+
+async def enqueue_job(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> None:
+    queue: asyncio.Queue = context.application.bot_data["download_queue"]
+    active_jobs: set[int] = context.application.bot_data["active_jobs"]
+    limiter: RateLimiter = context.application.bot_data["rate_limiter"]
+    user_id = query.from_user.id
+
+    if not limiter.allow(user_id):
+        await query.answer("Too many requests. Slow down.", show_alert=True)
+        return
+    if user_id in active_jobs:
+        await query.answer("You already have an active download.", show_alert=True)
+        return
+    url = context.user_data.get("current_url")
+    if not url:
+        await query.answer("No URL in session. Send a link first.", show_alert=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    status = await query.message.reply_text(
+        f"🚀 Starting download\n📌 Queue position: {queue.qsize() + 1}",
+        disable_web_page_preview=True,
+    )
+    job = DownloadJob(
+        user_id=user_id,
+        chat_id=query.message.chat_id,
+        status_message_id=status.message_id,
+        url=url,
+        action=action,
+        future=future,
+    )
+    try:
+        queue.put_nowait(job)
+    except asyncio.QueueFull:
+        await status.edit_text("❌ Queue is full. Please try again later.")
+        return
+
+    active_jobs.add(user_id)
+    try:
+        await future
+    except Exception as exc:
+        await status.edit_text(
+            f"❌ Error\n<code>{html.escape(str(exc)[:250])}</code>",
+            parse_mode=ParseMode.HTML,
         )
 
-    # ── Third-party bypass engines ────────────────────────────────────────
 
-    async def bypass_download_pdf(self, doc_id: str, doc_url: str) -> bytes | None:
-        for gw in self.BYPASS_GATEWAYS:
-            try:
-                logger.info("Trying bypass via %s …", gw["name"])
-                pdf = await self._try_gateway(gw, doc_id, doc_url)
-                if pdf and len(pdf) > 5000:
-                    logger.info("Bypass via %s succeeded (%d bytes)", gw["name"], len(pdf))
-                    return pdf
-            except Exception as exc:
-                logger.warning("Bypass %s failed: %s", gw["name"], exc)
-        return None
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_access(update, context):
+        return STATE_MENU
 
-    async def _try_gateway(
-        self, gw: dict, doc_id: str, doc_url: str
-    ) -> bytes | None:
-        payload = {"url": doc_url, "doc_id": doc_id}
-        kw: dict = dict(
-            headers={**BROWSER_HEADERS, "Referer": gw["url"]},
-            timeout=aiohttp.ClientTimeout(total=60),
-            ssl=False,
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    state: StateManager = context.application.bot_data["state"]
+
+    if data == "menu:download":
+        await query.edit_message_text(
+            "📥 Send a public webpage/document URL.",
+            reply_markup=kb_main_menu(),
         )
-        if gw["method"] == "post":
-            req = self.session.post(gw["url"], data=payload, **kw)
-        else:
-            req = self.session.get(gw["url"], params={"url": doc_url}, **kw)
+        return STATE_MENU
 
-        async with req as r:
-            ct = r.headers.get("Content-Type", "")
-            if "pdf" in ct or "octet-stream" in ct:
-                return await r.read()
-            body = await r.text()
-            link = self._find_download_link(body)
-            if link:
-                return await self._get_bytes(link)
-        return None
+    if data == "menu:extract":
+        await query.edit_message_text(
+            "📚 Send a URL, then choose <b>📄 Extract Text</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_main_menu(),
+        )
+        return STATE_MENU
 
-    @staticmethod
-    def _find_download_link(text: str) -> str | None:
-        try:
-            data = json.loads(text)
-            for k in ("download_url", "downloadUrl", "url", "link", "file"):
-                if k in data:
-                    return str(data[k])
-        except Exception:
-            pass
-        m = re.search(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', text)
-        if m:
-            return m.group(1)
-        m = re.search(r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)', text)
-        return m.group(1) if m else None
+    if data == "menu:snapshot":
+        await query.edit_message_text(
+            "🌐 Send a URL, then choose <b>🌐 Save HTML</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_main_menu(),
+        )
+        return STATE_MENU
+
+    if data == "menu:my":
+        hist_text, hist_kb = await render_history_message(query.from_user.id, state, 0)
+        await query.edit_message_text(
+            hist_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=hist_kb,
+        )
+        return STATE_MENU
+
+    if data.startswith("hist:"):
+        if data == "hist:noop":
+            return STATE_MENU
+        page = int(data.split(":", 1)[1])
+        hist_text, hist_kb = await render_history_message(query.from_user.id, state, page)
+        await query.edit_message_text(
+            hist_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=hist_kb,
+        )
+        return STATE_MENU
+
+    if data == "menu:settings":
+        enabled = bool(await state.get_setting(query.from_user.id, "preview_enabled", True))
+        await query.edit_message_text(
+            "⚙️ <b>Settings</b>\n\nConfigure your bot behavior:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings(enabled),
+        )
+        return STATE_MENU
+
+    if data == "settings:toggle_preview":
+        enabled = await state.toggle_preview(query.from_user.id)
+        await query.edit_message_text(
+            "⚙️ <b>Settings</b>\n\nConfigure your bot behavior:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings(enabled),
+        )
+        return STATE_MENU
+
+    if data == "menu:help":
+        await query.edit_message_text(
+            "Use /help for complete instructions.",
+            reply_markup=kb_main_menu(),
+        )
+        return STATE_MENU
+
+    if data == "menu:back":
+        await query.edit_message_text(
+            "Main menu:",
+            reply_markup=kb_main_menu(),
+        )
+        return STATE_MENU
+
+    if data.startswith("asset:"):
+        if data == "asset:noop":
+            return STATE_MENU
+        url = context.user_data.get("current_url")
+        if not url:
+            await query.answer("No active URL. Send link first.", show_alert=True)
+            return STATE_MENU
+        parser: ParserEngine = context.application.bot_data["parser"]
+        parsed = await parser.parse(url)
+        page = int(context.user_data.get("asset_page", 0))
+        page = page - 1 if data == "asset:prev" else page + 1
+        msg, total_pages = render_asset_page(parsed, page)
+        page = max(0, min(page, total_pages - 1))
+        context.user_data["asset_page"] = page
+        await query.edit_message_text(
+            msg,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=kb_link_actions(page, total_pages),
+        )
+        return STATE_MENU
+
+    if data.startswith("action:"):
+        action = data.split(":", 1)[1]
+        if action in {"pdf", "images", "text", "html"}:
+            await enqueue_job(query, context, action)
+        return STATE_MENU
+
+    return STATE_MENU
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DECORATORS
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def auth_required(func):
-    @wraps(func)
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id
-        if not user_mgr.is_authorized(uid):
-            await update.message.reply_text(
-                "❌ <b>Access Denied</b>\n\n"
-                "You are not authorized. Contact the bot owner.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        return await func(update, ctx)
-
-    return wrapper
-
+# =============================================================================
+# 7) ADMIN COMMANDS
+# =============================================================================
 
 def owner_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != OWNER_ID:
-            await update.message.reply_text("❌ Owner-only command.")
+            await update.effective_message.reply_text("❌ Owner-only command.")
             return
-        return await func(update, ctx)
+        return await func(update, context)
 
     return wrapper
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DOWNLOAD LOGIC (per-format)
-# ═══════════════════════════════════════════════════════════════════════════
-
-_safe_fn = re.compile(r"[^\w\s-]")
-_pending: dict[int, dict] = {}
-
-
-def _filename(title: str) -> str:
-    return _safe_fn.sub("", title)[:60].strip() or "document"
-
-
-def _progress_bar(pct: int) -> str:
-    filled = pct // 10
-    return "█" * filled + "░" * (10 - filled)
-
-
-async def _send_pdf(query, scraper: ScribdScraper, meta: dict):
-    doc_id, doc_url = meta["doc_id"], meta["url"]
-
-    await query.edit_message_text(
-        "🔄 <b>Bypassing Paywall…</b>\n\n⚡ Trying bypass engines…",
-        parse_mode=ParseMode.HTML,
-    )
-    pdf = await scraper.bypass_download_pdf(doc_id, doc_url)
-
-    if not pdf:
-        await query.edit_message_text(
-            "🔄 <b>Direct bypass unavailable</b>\n\n"
-            "📦 Falling back to page-image extraction…",
-            parse_mode=ParseMode.HTML,
-        )
-        urls = await scraper.extract_image_urls(meta)
-        if not urls:
-            await query.edit_message_text(
-                "❌ <b>Could not extract pages</b>\n\n"
-                "No downloadable page images found. Try TXT or HTML.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        total = len(urls)
-
-        async def _prog(cur: int, tot: int):
-            if cur % max(1, tot // 5) == 0 or cur == tot:
-                pct = int(cur / tot * 100)
-                try:
-                    await query.edit_message_text(
-                        f"📦 <b>Extracting {tot} Pages…</b>\n\n"
-                        f"[{_progress_bar(pct)}] {pct}%\n"
-                        f"📄 Page {cur}/{tot}",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-
-        blobs = await scraper.download_images(urls, progress_cb=_prog)
-        if not blobs:
-            await query.edit_message_text(
-                "❌ <b>Image download failed</b>", parse_mode=ParseMode.HTML
-            )
-            return
-
-        await query.edit_message_text(
-            f"📦 <b>Converting {len(blobs)} pages to PDF…</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        pdf = scraper.images_to_pdf(blobs)
-
-    name = _filename(meta["title"])
-    size_mb = len(pdf) / 1024 / 1024
-    await query.edit_message_text(
-        f"📤 <b>Sending PDF…</b>  ({size_mb:.1f} MB)", parse_mode=ParseMode.HTML
-    )
-    await query.message.reply_document(
-        document=io.BytesIO(pdf),
-        filename=f"{name}.pdf",
-        caption=(
-            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
-            f"✍️ {html_mod.escape(meta['author'])} · "
-            f"📄 {meta['page_count']} pages · 📕 PDF\n\n"
-            "⚡ <i>Scribd Bypass Bot</i>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-    await query.edit_message_text(
-        f"✅ <b>PDF sent!</b>\n📖 {html_mod.escape(meta['title'])}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def _send_txt(query, scraper: ScribdScraper, meta: dict):
-    await query.edit_message_text(
-        "📦 <b>Extracting text…</b>", parse_mode=ParseMode.HTML
-    )
-    text = await scraper.extract_text(meta)
-    if not text or len(text.strip()) < 50:
-        await query.edit_message_text(
-            "❌ <b>Text extraction failed</b>\n\n"
-            "This may be a scanned/image-only document.\n"
-            "Try PDF or Images format.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    header = (
-        f"{'=' * 60}\n{meta['title']}\n"
-        f"Author: {meta['author']}\nPages: {meta['page_count']}\n{'=' * 60}\n\n"
-    )
-    full = header + text
-    name = _filename(meta["title"])
-    await query.message.reply_document(
-        document=io.BytesIO(full.encode()),
-        filename=f"{name}.txt",
-        caption=(
-            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
-            f"📝 TXT · {len(full):,} chars\n\n"
-            "⚡ <i>Scribd Bypass Bot</i>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-    await query.edit_message_text(
-        f"✅ <b>Text sent!</b>\n📝 {len(full):,} characters",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def _send_html(query, scraper: ScribdScraper, meta: dict):
-    await query.edit_message_text(
-        "📦 <b>Building HTML…</b>", parse_mode=ParseMode.HTML
-    )
-    content = await scraper.build_html(meta)
-    name = _filename(meta["title"])
-    await query.message.reply_document(
-        document=io.BytesIO(content.encode()),
-        filename=f"{name}.html",
-        caption=(
-            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
-            f"🌐 HTML · {len(content) / 1024:.1f} KB\n\n"
-            "⚡ <i>Scribd Bypass Bot</i>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-    await query.edit_message_text(
-        f"✅ <b>HTML sent!</b>\n🌐 {html_mod.escape(meta['title'])}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def _send_images(query, scraper: ScribdScraper, meta: dict):
-    await query.edit_message_text(
-        "🔄 <b>Extracting image URLs…</b>", parse_mode=ParseMode.HTML
-    )
-    urls = await scraper.extract_image_urls(meta)
-    if not urls:
-        await query.edit_message_text(
-            "❌ <b>No page images found</b>\nTry PDF or TXT.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    total = len(urls)
-
-    async def _prog(cur: int, tot: int):
-        if cur % max(1, tot // 5) == 0 or cur == tot:
-            pct = int(cur / tot * 100)
-            try:
-                await query.edit_message_text(
-                    f"📦 <b>Downloading High-Res Images…</b>\n\n"
-                    f"[{_progress_bar(pct)}] {pct}%\n"
-                    f"🖼 Image {cur}/{tot}",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-
-    blobs = await scraper.download_images(urls, progress_cb=_prog)
-    if not blobs:
-        await query.edit_message_text(
-            "❌ <b>Image download failed</b>", parse_mode=ParseMode.HTML
-        )
-        return
-
-    await query.edit_message_text(
-        f"📤 <b>Packaging {len(blobs)} images into ZIP…</b>",
-        parse_mode=ParseMode.HTML,
-    )
-    name = _filename(meta["title"])
-    zipdata = scraper.images_to_zip(blobs, title=name)
-    await query.message.reply_document(
-        document=io.BytesIO(zipdata),
-        filename=f"{name}_images.zip",
-        caption=(
-            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
-            f"🖼 {len(blobs)} high-res images · "
-            f"{len(zipdata) / 1024 / 1024:.1f} MB\n\n"
-            "⚡ <i>Scribd Bypass Bot</i>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-    await query.edit_message_text(
-        f"✅ <b>Images ZIP sent!</b>\n🖼 {len(blobs)} pages",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TELEGRAM COMMAND & MESSAGE HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    await update.message.reply_text(
-        f"🚀 <b>Scribd Paywall Bypass Downloader</b>\n\n"
-        f"Welcome, {html_mod.escape(u.first_name)}!\n\n"
-        f"📥 <b>How to use:</b>\n"
-        f"Send any Scribd document URL and I'll bypass the paywall.\n\n"
-        f"⚡ <b>Formats:</b>\n"
-        f"  📕 PDF — full document\n"
-        f"  📝 TXT — extracted plain text\n"
-        f"  🌐 HTML — formatted web page\n"
-        f"  🖼 Images — high-res pages (ZIP)\n\n"
-        f"📋 <b>Commands:</b>\n"
-        f"  /start  — this message\n"
-        f"  /help   — detailed help\n"
-        f"  /status — bot status\n\n"
-        f"<i>Your ID: <code>{u.id}</code></i>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    is_owner = update.effective_user.id == OWNER_ID
-    owner_block = ""
-    if is_owner:
-        owner_block = (
-            "\n\n👑 <b>Owner Commands:</b>\n"
-            "  /add_user <code>[ID]</code> — authorize user\n"
-            "  /remove_user <code>[ID]</code> — revoke access\n"
-            "  /users — list authorized users\n"
-            "  /broadcast <code>[msg]</code> — message all users"
-        )
-    await update.message.reply_text(
-        "📖 <b>Help — Scribd Bypass Downloader</b>\n\n"
-        "<b>1.</b> Copy a Scribd URL, e.g.:\n"
-        "<code>https://www.scribd.com/document/123456/Title</code>\n\n"
-        "<b>2.</b> Paste it here.\n\n"
-        "<b>3.</b> Pick a format from the buttons.\n\n"
-        "<b>4.</b> Wait — the bot tries multiple bypass engines.\n\n"
-        "⚡ Uses fallback image-scrape → PDF conversion when direct "
-        "bypass is unavailable."
-        f"{owner_block}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@auth_required
-async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ <b>Bot Status: Online</b>\n\n"
-        f"👥 Authorized users: {len(user_mgr.all_ids)}\n"
-        f"📊 Pending downloads: {len(_pending)}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
 @owner_only
-async def cmd_add_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text(
-            "⚠️ Usage: <code>/add_user ID [ID …]</code>",
-            parse_mode=ParseMode.HTML,
-        )
+async def cmd_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /add_user [id]")
         return
-    lines: list[str] = []
-    for arg in ctx.args:
+    state: StateManager = context.application.bot_data["state"]
+    lines = []
+    for raw in context.args:
         try:
-            uid = int(arg)
-            if user_mgr.add(uid):
-                lines.append(f"✅ <code>{uid}</code> authorized")
-            else:
-                lines.append(f"ℹ️ <code>{uid}</code> already authorized")
+            uid = int(raw)
         except ValueError:
-            lines.append(f"❌ Invalid: <code>{arg}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            lines.append(f"❌ Invalid ID: {raw}")
+            continue
+        created = await state.add_user(uid)
+        lines.append(f"✅ Added {uid}" if created else f"ℹ️ Already exists: {uid}")
+    await update.message.reply_text("\n".join(lines))
 
 
 @owner_only
-async def cmd_remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text(
-            "⚠️ Usage: <code>/remove_user ID [ID …]</code>",
-            parse_mode=ParseMode.HTML,
-        )
+async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /remove_user [id]")
         return
-    lines: list[str] = []
-    for arg in ctx.args:
+    state: StateManager = context.application.bot_data["state"]
+    lines = []
+    for raw in context.args:
         try:
-            uid = int(arg)
-            if user_mgr.remove(uid):
-                lines.append(f"✅ <code>{uid}</code> removed")
-            else:
-                lines.append(f"❌ <code>{uid}</code> — owner or not found")
+            uid = int(raw)
         except ValueError:
-            lines.append(f"❌ Invalid: <code>{arg}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            lines.append(f"❌ Invalid ID: {raw}")
+            continue
+        removed = await state.remove_user(uid)
+        lines.append(f"✅ Removed {uid}" if removed else f"❌ Not removable: {uid}")
+    await update.message.reply_text("\n".join(lines))
 
 
 @owner_only
-async def cmd_users(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    ids = user_mgr.all_ids
-    listing = "\n".join(
-        f"  {'👑' if u == OWNER_ID else '👤'} <code>{u}</code>" for u in ids
-    )
-    await update.message.reply_text(
-        f"👥 <b>Authorized Users ({len(ids)}):</b>\n\n{listing}",
-        parse_mode=ParseMode.HTML,
-    )
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: StateManager = context.application.bot_data["state"]
+    users = await state.authorized_users()
+    msg = ["👥 Authorized users:"]
+    for uid in users:
+        msg.append(f"{'👑' if uid == OWNER_ID else '👤'} <code>{uid}</code>")
+    await update.message.reply_text("\n".join(msg), parse_mode=ParseMode.HTML)
 
 
 @owner_only
-async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text(
-            "⚠️ Usage: <code>/broadcast message text</code>",
-            parse_mode=ParseMode.HTML,
-        )
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast [message]")
         return
-    msg = " ".join(ctx.args)
+    state: StateManager = context.application.bot_data["state"]
+    targets = await state.known_users()
+    body = " ".join(context.args)
     sent = failed = 0
-    for uid in user_mgr.all_ids:
+    for uid in targets:
         try:
-            await ctx.bot.send_message(
-                uid,
-                f"📢 <b>Broadcast</b>\n\n{html_mod.escape(msg)}",
-                parse_mode=ParseMode.HTML,
-            )
+            await context.bot.send_message(uid, f"📢 <b>Broadcast</b>\n\n{html.escape(body)}", parse_mode=ParseMode.HTML)
             sent += 1
         except Exception:
             failed += 1
-    await update.message.reply_text(
-        f"📢 Done — ✅ {sent} sent, ❌ {failed} failed"
-    )
+    await update.message.reply_text(f"Broadcast complete. ✅ {sent} sent | ❌ {failed} failed")
 
 
-# ── URL handler ───────────────────────────────────────────────────────────
-
-
-@auth_required
-async def handle_url(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    doc_id_match = SCRIBD_URL_RE.search(text)
-    if not doc_id_match:
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_access(update, context):
         return
-    doc_id = doc_id_match.group(1)
-
-    status = await update.message.reply_text(
-        "🔄 <b>Analyzing document…</b>\n⏳ Fetching metadata from Scribd…",
+    state: StateManager = context.application.bot_data["state"]
+    stats = await state.user_stats(update.effective_user.id)
+    await update.message.reply_text(
+        (
+            "📊 <b>Your Statistics</b>\n\n"
+            f"Requests: <b>{stats['requests']}</b>\n"
+            f"Downloads: <b>{stats['downloads']}</b>\n"
+            f"Errors: <b>{stats['errors']}</b>\n"
+            f"PDF: {stats['pdf']} | Images: {stats['images']} | "
+            f"TXT: {stats['text']} | HTML: {stats['html']}\n"
+            f"Total sent: <b>{human_size(stats['bytes_sent'])}</b>"
+        ),
         parse_mode=ParseMode.HTML,
     )
 
+
+# =============================================================================
+# Download queue worker implementation
+# =============================================================================
+
+async def process_job(application: Application, job: DownloadJob) -> None:
+    state: StateManager = application.bot_data["state"]
+    parser: ParserEngine = application.bot_data["parser"]
+    downloader: DownloaderEngine = application.bot_data["downloader"]
+    active_jobs: set[int] = application.bot_data["active_jobs"]
+    bot = application.bot
+    reporter = ProgressReporter()
+
+    job_dir = TEMP_DIR / f"{job.user_id}_{int(time.time())}_{uuid4().hex[:8]}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    out_path: Path | None = None
+    out_size = 0
+    parsed_title = "document"
+
+    async def report(text: str) -> None:
+        await safe_edit_status(bot, job.chat_id, job.status_message_id, text)
+
     try:
-        async with aiohttp.ClientSession() as sess:
-            scraper = ScribdScraper(sess)
-            meta = await scraper.get_metadata(doc_id)
+        await report("🚀 Starting download\n⚡ Processing link")
+        parsed = await parser.parse(job.url)
+        parsed_title = safe_filename(parsed.title)
 
-        _pending[update.effective_user.id] = {"meta": meta, "url": text}
+        if job.action == "pdf":
+            # Priority: direct PDF > images->PDF > text->PDF.
+            if parsed.pdf_links:
+                out_path = job_dir / f"{parsed_title}.pdf"
 
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("📕 PDF", callback_data=f"dl:pdf:{doc_id}"),
-                    InlineKeyboardButton("📝 TXT", callback_data=f"dl:txt:{doc_id}"),
-                ],
-                [
-                    InlineKeyboardButton("🌐 HTML", callback_data=f"dl:html:{doc_id}"),
-                    InlineKeyboardButton(
-                        "🖼 Images (ZIP)", callback_data=f"dl:img:{doc_id}"
-                    ),
-                ],
-            ]
-        )
+                async def pdf_prog(downloaded: int, total: int) -> None:
+                    if reporter.should_report(force=total > 0 and downloaded >= total):
+                        pct = int((downloaded / total) * 100) if total else 0
+                        await report(f"📥 Downloading assets\nPDF stream: {pct}%")
 
-        pg = (
-            f"📄 Pages: <b>{meta['page_count']}</b>"
-            if meta["page_count"]
-            else "📄 Pages: <i>detecting…</i>"
-        )
-        desc = ""
-        if meta.get("description"):
-            desc = (
-                f"\n📝 {html_mod.escape(meta['description'][:150])}…"
+                out_size = await downloader.stream_to_file(parsed.pdf_links[0], out_path, progress_cb=pdf_prog)
+            elif parsed.image_links:
+                await report("📥 Downloading assets\nCollecting images...")
+
+                async def img_prog(done: int, total: int) -> None:
+                    if reporter.should_report(force=done >= total):
+                        pct = int((done / total) * 100)
+                        await report(f"📥 Downloading assets\nImages: {done}/{total} ({pct}%)")
+
+                image_paths = await downloader.download_images(
+                    parsed.image_links[:MAX_IMAGES_FOR_PDF],
+                    job_dir / "images",
+                    progress_cb=img_prog,
+                )
+                if not image_paths:
+                    raise RuntimeError("No downloadable images found for PDF conversion.")
+                await report("📦 Packaging files\nConverting images to PDF...")
+                out_path = job_dir / f"{parsed_title}.pdf"
+                out_size = await downloader.images_to_pdf(image_paths, out_path)
+            else:
+                text_source = parsed.text_content.strip()
+                if len(text_source) < 20:
+                    raise RuntimeError("Unable to build PDF: no PDF links, images, or readable text.")
+                await report("📦 Packaging files\nRendering text into PDF...")
+                out_path = job_dir / f"{parsed_title}.pdf"
+                out_size = await downloader.text_to_pdf(text_source[:150_000], parsed.title, out_path)
+
+        elif job.action == "images":
+            if not parsed.image_links:
+                raise RuntimeError("No image assets detected on this URL.")
+            await report("📥 Downloading assets\nCollecting images...")
+
+            async def img_prog(done: int, total: int) -> None:
+                if reporter.should_report(force=done >= total):
+                    pct = int((done / total) * 100)
+                    await report(f"📥 Downloading assets\nImages: {done}/{total} ({pct}%)")
+
+            image_paths = await downloader.download_images(parsed.image_links, job_dir / "images", progress_cb=img_prog)
+            if not image_paths:
+                raise RuntimeError("All image downloads failed.")
+            await report("📦 Packaging files\nCreating ZIP archive...")
+            out_path = job_dir / f"{parsed_title}_images.zip"
+            out_size = await downloader.make_zip(image_paths, out_path)
+
+        elif job.action == "text":
+            text_data = parsed.text_content.strip()
+            if not text_data:
+                raise RuntimeError("No readable text found on this page.")
+            await report("📦 Packaging files\nWriting TXT...")
+            out_path = job_dir / f"{parsed_title}.txt"
+            header = (
+                f"Title: {parsed.title}\nURL: {parsed.final_url}\n"
+                f"Extracted: {utc_iso_now()}\n{'=' * 70}\n\n"
+            )
+            out_size = await downloader.write_text(header + text_data, out_path)
+
+        elif job.action == "html":
+            html_data = parsed.html_content
+            if not html_data:
+                html_data = (
+                    "<!doctype html><html><body>"
+                    f"<h1>{html.escape(parsed.title)}</h1>"
+                    f"<p>Original URL: {html.escape(parsed.final_url)}</p>"
+                    "</body></html>"
+                )
+            await report("📦 Packaging files\nSaving HTML snapshot...")
+            out_path = job_dir / f"{parsed_title}.html"
+            out_size = await downloader.write_html(html_data, out_path)
+        else:
+            raise RuntimeError(f"Unsupported action: {job.action}")
+
+        if not out_path or not out_path.exists():
+            raise RuntimeError("Output file was not created.")
+
+        await report("📤 Uploading to Telegram")
+        await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+        with out_path.open("rb") as payload:
+            await bot.send_document(
+                chat_id=job.chat_id,
+                document=payload,
+                filename=out_path.name,
+                caption=(
+                    f"✅ <b>{html.escape(parsed.title)}</b>\n"
+                    f"Format: {action_label(job.action)}\n"
+                    f"Size: {human_size(out_size)}"
+                ),
+                parse_mode=ParseMode.HTML,
             )
 
-        await status.edit_text(
-            f"✅ <b>Document Found!</b>\n\n"
-            f"📖 <b>{html_mod.escape(meta['title'])}</b>\n"
-            f"✍️ {html_mod.escape(meta['author'])}\n"
-            f"{pg}\n"
-            f"🔗 ID: <code>{doc_id}</code>"
-            f"{desc}\n\n"
-            f"⚡ Select download format:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+        await report("✅ Completed")
+
+        await state.bump_stats(job.user_id, action=job.action, success=True, bytes_sent=out_size)
+        await state.add_history(
+            job.user_id,
+            {
+                "timestamp": utc_iso_now(),
+                "url": job.url,
+                "title": parsed_title,
+                "action": job.action,
+                "status": "completed",
+                "size_bytes": out_size,
+            },
         )
+        if not job.future.done():
+            job.future.set_result(True)
+
     except Exception as exc:
-        logger.error("Metadata fetch failed: %s", exc, exc_info=True)
-        await status.edit_text(
-            f"❌ <b>Error</b>\n<code>{html_mod.escape(str(exc)[:200])}</code>",
-            parse_mode=ParseMode.HTML,
+        logging.exception("Job processing failed")
+        await state.bump_stats(job.user_id, action=job.action, success=False)
+        await state.add_history(
+            job.user_id,
+            {
+                "timestamp": utc_iso_now(),
+                "url": job.url,
+                "title": parsed_title,
+                "action": job.action,
+                "status": "failed",
+                "size_bytes": 0,
+                "error": str(exc)[:200],
+            },
         )
+        await report(f"❌ Error\n<code>{html.escape(str(exc)[:250])}</code>")
+        if not job.future.done():
+            job.future.set_exception(exc)
+    finally:
+        active_jobs.discard(job.user_id)
+        await rm_tree(job_dir)
 
 
-# ── Callback (format selection) ──────────────────────────────────────────
-
-_FMT_DISPATCH = {
-    "pdf": _send_pdf,
-    "txt": _send_txt,
-    "html": _send_html,
-    "img": _send_images,
-}
-
-_FMT_LABELS = {
-    "pdf": "📕 PDF",
-    "txt": "📝 TXT",
-    "html": "🌐 HTML",
-    "img": "🖼 Images",
-}
+async def queue_worker(application: Application, worker_id: int) -> None:
+    queue: asyncio.Queue = application.bot_data["download_queue"]
+    logging.info("Worker-%d started", worker_id)
+    while True:
+        job: DownloadJob = await queue.get()
+        try:
+            await process_job(application, job)
+        except Exception:
+            logging.exception("Worker-%d unexpected failure", worker_id)
+        finally:
+            queue.task_done()
 
 
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# =============================================================================
+# 8) MAIN ASYNC RUNNER
+# =============================================================================
 
-    uid = query.from_user.id
-    if not user_mgr.is_authorized(uid):
-        await query.answer("❌ Not authorized", show_alert=True)
-        return
+async def post_init(application: Application) -> None:
+    await ensure_dirs()
+    await cleanup_old_temp()
 
-    parts = query.data.split(":", 2)
-    if len(parts) != 3 or parts[0] != "dl":
-        return
-    fmt, doc_id = parts[1], parts[2]
+    state = StateManager(STATE_FILE)
+    await state.load()
 
-    info = _pending.get(uid)
-    if not info:
-        await query.edit_message_text("❌ Session expired — send the URL again.")
-        return
+    session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT, headers=DEFAULT_HEADERS)
+    downloader = DownloaderEngine(session)
+    parser = ParserEngine(downloader, TTLCache(CACHE_TTL_SECONDS, CACHE_MAX_ITEMS))
 
-    meta = info["meta"]
-    label = _FMT_LABELS.get(fmt, fmt.upper())
-    await query.edit_message_text(
-        f"🔄 <b>Bypassing Paywall…</b>\n\n"
-        f"📖 {html_mod.escape(meta['title'])}\n"
-        f"📦 Format: {label}\n\n⏳ Please wait…",
-        parse_mode=ParseMode.HTML,
+    application.bot_data["state"] = state
+    application.bot_data["session"] = session
+    application.bot_data["downloader"] = downloader
+    application.bot_data["parser"] = parser
+    application.bot_data["rate_limiter"] = RateLimiter(RATE_LIMIT_COUNT, RATE_LIMIT_WINDOW)
+    application.bot_data["download_queue"] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+    application.bot_data["active_jobs"] = set()
+    application.bot_data["workers"] = [
+        asyncio.create_task(queue_worker(application, i + 1))
+        for i in range(WORKER_COUNT)
+    ]
+    logging.info("Bot initialized with %d workers", WORKER_COUNT)
+
+
+async def post_shutdown(application: Application) -> None:
+    workers: list[asyncio.Task] = application.bot_data.get("workers", [])
+    for task in workers:
+        task.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    session: aiohttp.ClientSession | None = application.bot_data.get("session")
+    if session:
+        await session.close()
+
+    await cleanup_old_temp()
+    logging.info("Bot shutdown complete")
+
+
+def setup_logging() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        ],
     )
 
-    handler = _FMT_DISPATCH.get(fmt)
-    if not handler:
-        await query.edit_message_text("❌ Unknown format.")
-        return
 
-    try:
-        await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
-        async with aiohttp.ClientSession() as sess:
-            scraper = ScribdScraper(sess)
-            await handler(query, scraper, meta)
-    except Exception as exc:
-        logger.error("Download failed: %s", exc, exc_info=True)
-        await query.edit_message_text(
-            f"❌ <b>Download Failed</b>\n\n"
-            f"<code>{html_mod.escape(str(exc)[:300])}</code>\n\n"
-            "Try a different format or re-send the URL.",
-            parse_mode=ParseMode.HTML,
-        )
-    finally:
-        _pending.pop(uid, None)
+def build_application() -> Application:
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
+    conversation = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            STATE_MENU: [
+                CallbackQueryHandler(on_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
+                CommandHandler("help", cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", cmd_start)],
+        allow_reentry=True,
+    )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def main() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    if BOT_TOKEN in ("YOUR_BOT_TOKEN_HERE", ""):
-        logger.error("Set BOT_TOKEN env var or edit the script.")
-        return
-    if OWNER_ID == 0:
-        logger.warning("OWNER_ID is 0 — admin commands disabled.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(conversation)
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+
+    # Owner admin controls
     app.add_handler(CommandHandler("add_user", cmd_add_user))
     app.add_handler(CommandHandler("remove_user", cmd_remove_user))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Regex(SCRIBD_URL_RE),
-            handle_url,
-        )
-    )
-    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^dl:"))
+    return app
 
-    logger.info("🚀 Scribd Bypass Bot starting (owner=%s)…", OWNER_ID)
+
+def main() -> None:
+    setup_logging()
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set. Export BOT_TOKEN before running.")
+    logging.info("Starting Universal Document Downloader Bot (owner=%s)", OWNER_ID)
+    app = build_application()
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
