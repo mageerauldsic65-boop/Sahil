@@ -1,959 +1,1235 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-╔═══════════════════════════════════════════════════════════════════════════╗
-║       TELEGRAM BOT - SCRIBD PUBLIC DOCUMENT RESEARCH TOOL v2.0           ║
-║                                                                           ║
-║  Legitimate Public Metadata Extraction & Analysis                        ║
-║  • Fetches public document metadata (title, author, pages)               ║
-║  • Respects author access controls (Public/Free only)                    ║
-║  • Async/Non-blocking Architecture (aiohttp + asyncio)                  ║
-║  • BeautifulSoup HTML parsing for robust data extraction                ║
-║  • Owner-only admin system with user management                         ║
-║  • Real-time status updates with premium emojis                         ║
-║  • Termux optimized & production-ready                                   ║
-║                                                                           ║
-║  Author: AI Assistant | License: MIT | Version: 2.0                     ║
-╚═══════════════════════════════════════════════════════════════════════════╝
+Scribd Paywall Bypass Downloader — Telegram Bot (v3.0)
+======================================================
+High-performance async Telegram bot that bypasses the Scribd paywall
+to download documents as PDF, TXT, HTML, or high-res Images (ZIP).
 
-LEGAL DISCLAIMER:
-This bot performs LEGITIMATE metadata extraction on publicly available Scribd
-documents only. It:
-  ✓ Respects robots.txt and access controls
-  ✓ Only processes documents marked as 'Public' or 'Free' by authors
-  ✓ Extracts publicly visible metadata (title, author, page count)
-  ✓ Does NOT bypass paywalls or access restrictions
-  ✓ Does NOT download protected/private documents
-  ✓ Complies with Scribd's Terms of Service for public data access
+Features:
+  - Robust page-count extraction via regex + BeautifulSoup (6 strategies)
+  - Multi-engine bypass: direct image scrape → third-party gateways
+  - High-res original image download → PDF compile or ZIP archive
+  - Owner / user authorization system with persistent JSON storage
+  - Real-time progress bars inside Telegram messages
+  - Fully async (aiohttp + asyncio), optimized for Termux
 
-Usage is intended for legitimate research, educational, and reference purposes.
+Requirements:
+    pip install python-telegram-bot[ext] aiohttp beautifulsoup4 Pillow lxml
 """
 
 import asyncio
+import html as html_mod
+import io
 import json
 import logging
 import os
 import re
-import io
-from datetime import datetime
+import zipfile
+from functools import wraps
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
-from urllib.parse import urlparse, urljoin
-from dataclasses import dataclass
 
 import aiohttp
 from bs4 import BeautifulSoup
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile
-)
+from PIL import Image
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
-from telegram.constants import ParseMode
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⚙️  CONFIGURATION SECTION - EDIT HERE
+# CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN = "8674547740:AAHP3wLLo1-0CRLkY7F4bc6xL0JcqPEqrQU"  # Get from @BotFather
-OWNER_ID = 6512242172  # Your Telegram User ID
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN", "8674547740:AAHP3wLLo1-0CRLkY7F4bc6xL0JcqPEqrQU"
+)
+OWNER_ID = int(os.getenv("OWNER_ID", "6512242172"))
 
-# System Settings
-SETTINGS = {
-    "REQUEST_TIMEOUT": 15,  # seconds
-    "TEMP_DIR": "/tmp/scribd_research_bot",  # Termux-compatible path
-    "DATA_FILE": "authorized_users.json",
-    "LOG_LEVEL": logging.INFO,
-    "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "MAX_FILE_SIZE": 100 * 1024 * 1024,  # 100MB
+DATA_DIR = Path("bot_data")
+USERS_FILE = DATA_DIR / "users.json"
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=120)
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
 
-# Create temp directory
-Path(SETTINGS["TEMP_DIR"]).mkdir(parents=True, exist_ok=True)
+SCRIBD_URL_RE = re.compile(
+    r"https?://(?:www\.)?scribd\.com/"
+    r"(?:document|doc|book|read|presentation|audiobook)/"
+    r"(\d+)"
+)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 📋 LOGGING SETUP
-# ═══════════════════════════════════════════════════════════════════════════
+HTML_PARSER = "lxml"
+try:
+    BeautifulSoup("", HTML_PARSER)
+except Exception:
+    HTML_PARSER = "html.parser"
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=SETTINGS["LOG_LEVEL"],
-    handlers=[
-        logging.FileHandler('scribd_research_bot.log'),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ScribdBot")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 📊 DATA MODELS
+# USER MANAGER (persistent JSON)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class ScribdDocument:
-    """Represents a Scribd document's public metadata."""
-    doc_id: str
-    title: str
-    author: str
-    page_count: int
-    description: str
-    access_level: str  # 'public', 'private', 'paid', 'free', 'unknown'
-    url: str
-    language: str = "Unknown"
-    is_downloadable: bool = False
-    error: Optional[str] = None
-    
-    def is_accessible(self) -> bool:
-        """Check if document is publicly accessible."""
-        return self.access_level.lower() in ['public', 'free']
+
+class UserManager:
+    def __init__(self) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._users: set[int] = set()
+        self._load()
+
+    def _load(self) -> None:
+        if USERS_FILE.exists():
+            try:
+                data = json.loads(USERS_FILE.read_text())
+                self._users = set(data.get("users", []))
+            except (json.JSONDecodeError, KeyError):
+                self._users = set()
+        if OWNER_ID:
+            self._users.add(OWNER_ID)
+        self._save()
+
+    def _save(self) -> None:
+        USERS_FILE.write_text(
+            json.dumps({"users": sorted(self._users)}, indent=2)
+        )
+
+    def add(self, uid: int) -> bool:
+        if uid in self._users:
+            return False
+        self._users.add(uid)
+        self._save()
+        return True
+
+    def remove(self, uid: int) -> bool:
+        if uid == OWNER_ID or uid not in self._users:
+            return False
+        self._users.discard(uid)
+        self._save()
+        return True
+
+    def is_authorized(self, uid: int) -> bool:
+        return uid in self._users
+
+    @property
+    def all_ids(self) -> list[int]:
+        return sorted(self._users)
+
+
+user_mgr = UserManager()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🗄️  USER DATABASE MANAGEMENT
+# SCRIBD SCRAPER — page-count, images, bypass
 # ═══════════════════════════════════════════════════════════════════════════
 
-class UserDatabase:
-    """Persistent user management with JSON storage."""
-    
-    def __init__(self, filepath: str = SETTINGS["DATA_FILE"]):
-        self.filepath = filepath
-        self.data = {"authorized_users": [], "created_at": datetime.now().isoformat()}
-        self.load()
-    
-    def load(self):
-        """Load users from JSON file."""
-        try:
-            if Path(self.filepath).exists():
-                with open(self.filepath, 'r') as f:
-                    self.data = json.load(f)
-                logger.info(f"✅ Loaded {len(self.data['authorized_users'])} authorized users")
-            else:
-                self.save()
-        except Exception as e:
-            logger.error(f"❌ Error loading database: {e}")
-    
-    def save(self):
-        """Save users to JSON file."""
-        try:
-            with open(self.filepath, 'w') as f:
-                json.dump(self.data, f, indent=2)
-        except Exception as e:
-            logger.error(f"❌ Error saving database: {e}")
-    
-    def add_user(self, user_id: int) -> bool:
-        """Add authorized user."""
-        if user_id not in self.data["authorized_users"]:
-            self.data["authorized_users"].append(user_id)
-            self.save()
-            logger.info(f"✅ Added user {user_id}")
-            return True
-        return False
-    
-    def remove_user(self, user_id: int) -> bool:
-        """Remove authorized user."""
-        if user_id in self.data["authorized_users"]:
-            self.data["authorized_users"].remove(user_id)
-            self.save()
-            logger.info(f"❌ Removed user {user_id}")
-            return True
-        return False
-    
-    def is_authorized(self, user_id: int) -> bool:
-        """Check if user is authorized."""
-        return user_id == OWNER_ID or user_id in self.data["authorized_users"]
-    
-    def get_users(self) -> List[int]:
-        """Get all authorized users."""
-        return self.data["authorized_users"]
 
-db = UserDatabase()
+class ScribdScraper:
+    BYPASS_GATEWAYS = [
+        {"name": "DLScrib", "url": "https://dlscrib.com/fetch", "method": "post"},
+        {
+            "name": "DocDownloader",
+            "url": "https://www.docdownloader.com/api/scribd",
+            "method": "post",
+        },
+        {
+            "name": "ScribFree",
+            "url": "https://scribfree.com/download",
+            "method": "get",
+        },
+    ]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 🌐 SCRIBD METADATA EXTRACTOR
-# ═══════════════════════════════════════════════════════════════════════════
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self.session = session
 
-class ScribdMetadataExtractor:
-    """
-    Legitimate public metadata extraction from Scribd documents.
-    Respects access controls and only processes public/free documents.
-    """
-    
-    def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.headers = {
-            "User-Agent": SETTINGS["USER_AGENT"],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+    # ── HTTP helpers ──────────────────────────────────────────────────────
+
+    async def _get_text(self, url: str, extra_headers: dict | None = None) -> str:
+        hdrs = {**BROWSER_HEADERS, **(extra_headers or {})}
+        async with self.session.get(
+            url,
+            headers=hdrs,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+            ssl=False,
+        ) as r:
+            r.raise_for_status()
+            return await r.text()
+
+    async def _get_bytes(self, url: str, extra_headers: dict | None = None) -> bytes:
+        hdrs = {**BROWSER_HEADERS, **(extra_headers or {})}
+        async with self.session.get(
+            url,
+            headers=hdrs,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+            ssl=False,
+        ) as r:
+            r.raise_for_status()
+            return await r.read()
+
+    # ── Metadata ──────────────────────────────────────────────────────────
+
+    async def get_metadata(self, doc_id: str) -> dict:
+        url = f"https://www.scribd.com/document/{doc_id}"
+        raw_html = await self._get_text(url)
+        soup = BeautifulSoup(raw_html, HTML_PARSER)
+
+        meta: dict = {
+            "doc_id": doc_id,
+            "url": url,
+            "title": "Unknown Document",
+            "author": "Unknown",
+            "description": "",
+            "page_count": 0,
+            "_html": raw_html,
+            "_soup": soup,
         }
-    
-    async def init_session(self):
-        """Initialize HTTP session."""
-        if not self.session:
-            timeout = aiohttp.ClientTimeout(total=SETTINGS["REQUEST_TIMEOUT"])
-            self.session = aiohttp.ClientSession(timeout=timeout)
-    
-    async def close_session(self):
-        """Close HTTP session."""
-        if self.session:
-            await self.session.close()
-    
-    def extract_doc_id(self, url: str) -> Optional[str]:
-        """Extract document ID from Scribd URL."""
-        patterns = [
-            r'scribd\.com/document/(\d+)',
-            r'scribd\.com/doc/(\d+)',
-            r'/document/(\d+)',
-            r'/doc/(\d+)',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, url, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
-    
-    async def fetch_html(self, url: str) -> Optional[str]:
-        """Fetch HTML content of Scribd page."""
-        await self.init_session()
-        try:
-            async with self.session.get(
-                url,
-                headers=self.headers,
-                allow_redirects=True,
-                ssl=False
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-                else:
-                    logger.warning(f"⚠️ HTTP {resp.status} for {url}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.error(f"⏱️ Timeout fetching {url}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Error fetching {url}: {e}")
-            return None
-    
-    def extract_page_count_from_html(self, html: str) -> int:
-        """
-        Extract page count from HTML using multiple robust methods.
-        
-        Methods:
-        1. JSON-LD structured data
-        2. Open Graph meta tags
-        3. JavaScript object data
-        4. Regex patterns in page content
-        """
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Method 1: Check JSON-LD structured data
-            json_ld_script = soup.find('script', {'type': 'application/ld+json'})
-            if json_ld_script:
+
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            meta["title"] = og_title["content"]
+        elif soup.title and soup.title.string:
+            meta["title"] = soup.title.string.strip()
+
+        for sel in [
+            soup.find("meta", attrs={"name": "author"}),
+            soup.select_one("a.author-name, span.author, a[href*='/user/']"),
+        ]:
+            if sel:
+                val = sel.get("content") or sel.get_text(strip=True)
+                if val:
+                    meta["author"] = val
+                    break
+
+        og_desc = soup.find("meta", property="og:description")
+        if og_desc and og_desc.get("content"):
+            meta["description"] = og_desc["content"][:300]
+
+        meta["page_count"] = self._extract_page_count(raw_html, soup)
+        return meta
+
+    # ── Page count (6 strategies) ─────────────────────────────────────────
+
+    def _extract_page_count(self, text: str, soup: BeautifulSoup) -> int:
+        for fn in (
+            self._pc_json_parse,
+            self._pc_json_fields,
+            self._pc_page_entities,
+            self._pc_meta_tags,
+            self._pc_ld_json,
+            self._pc_text_patterns,
+        ):
+            try:
+                n = fn(text, soup)
+                if n and n > 0:
+                    logger.info("Page count %d via %s", n, fn.__name__)
+                    return n
+            except Exception:
+                pass
+        return 0
+
+    @staticmethod
+    def _pc_json_parse(text: str, _s: BeautifulSoup) -> int:
+        for m in re.finditer(r"JSON\.parse\(['\"](.+?)['\"]\)", text):
+            try:
+                raw = m.group(1).encode().decode("unicode_escape")
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    for key in (
+                        "page_count", "pageCount", "pages",
+                        "num_pages", "totalPages",
+                    ):
+                        if key in data and int(data[key]) > 0:
+                            return int(data[key])
+                    for v in data.values():
+                        if isinstance(v, dict):
+                            for key in ("page_count", "pageCount"):
+                                if key in v:
+                                    return int(v[key])
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _pc_json_fields(text: str, _s: BeautifulSoup) -> int:
+        for pat in (
+            r'"page_count"\s*:\s*(\d+)',
+            r'"pageCount"\s*:\s*(\d+)',
+            r'"num_pages"\s*:\s*(\d+)',
+            r'"total_pages"\s*:\s*(\d+)',
+            r'"totalPages"\s*:\s*(\d+)',
+            r"'page_count'\s*:\s*(\d+)",
+            r'"contentPages"\s*:\s*(\d+)',
+        ):
+            m = re.search(pat, text)
+            if m:
+                return int(m.group(1))
+        return 0
+
+    @staticmethod
+    def _pc_page_entities(text: str, soup: BeautifulSoup) -> int:
+        elems = soup.find_all(
+            class_=re.compile(r"js.page.entity|page_entity|page-entity", re.I)
+        )
+        if elems:
+            return len(elems)
+        divs = soup.find_all("div", attrs={"data-page": True})
+        if divs:
+            return len(divs)
+        nums = re.findall(r'data-page-number="(\d+)"', text)
+        if nums:
+            return max(int(n) for n in nums)
+        return 0
+
+    @staticmethod
+    def _pc_meta_tags(_t: str, soup: BeautifulSoup) -> int:
+        for tag in soup.find_all("meta"):
+            name = (tag.get("name", "") or tag.get("property", "")).lower()
+            if "page" in name and "count" in name:
                 try:
-                    data = json.loads(json_ld_script.string)
-                    if isinstance(data, dict) and 'numberOfPages' in data:
-                        pages = int(data['numberOfPages'])
-                        logger.info(f"📄 Found page count via JSON-LD: {pages}")
-                        return pages
-                except (json.JSONDecodeError, ValueError, TypeError):
+                    return int(tag["content"])
+                except (ValueError, KeyError):
                     pass
-            
-            # Method 2: Check Open Graph meta tags
-            og_meta = soup.find('meta', {'property': 'og:description'})
-            if og_meta:
-                content = og_meta.get('content', '')
-                match = re.search(r'(\d+)\s*pages?', content, re.IGNORECASE)
-                if match:
-                    pages = int(match.group(1))
-                    logger.info(f"📄 Found page count via OG meta: {pages}")
-                    return pages
-            
-            # Method 3: Look for page count in title or description
-            title = soup.find('title')
-            if title:
-                match = re.search(r'(\d+)\s*pages?', title.string, re.IGNORECASE)
-                if match:
-                    pages = int(match.group(1))
-                    logger.info(f"📄 Found page count in title: {pages}")
-                    return pages
-            
-            # Method 4: Search for page count in all meta tags
-            for meta in soup.find_all('meta'):
-                content = meta.get('content', '')
-                if 'page' in content.lower():
-                    match = re.search(r'(\d+)', content)
-                    if match:
-                        pages = int(match.group(1))
-                        if pages > 0 and pages < 10000:  # Sanity check
-                            logger.info(f"📄 Found page count in meta tag: {pages}")
-                            return pages
-            
-            # Method 5: Look for JavaScript data objects
-            scripts = soup.find_all('script', {'type': 'text/javascript'})
-            for script in scripts:
-                if script.string:
-                    # Look for pageCount variable
-                    match = re.search(r'pageCount\s*[=:]\s*(\d+)', script.string)
-                    if match:
-                        pages = int(match.group(1))
-                        logger.info(f"📄 Found page count via JavaScript: {pages}")
-                        return pages
-                    
-                    # Look for totalPages variable
-                    match = re.search(r'totalPages\s*[=:]\s*(\d+)', script.string)
-                    if match:
-                        pages = int(match.group(1))
-                        logger.info(f"📄 Found total pages via JavaScript: {pages}")
-                        return pages
-            
-            logger.warning("⚠️ Could not determine page count from HTML")
-            return 0
-        
-        except Exception as e:
-            logger.error(f"❌ Error extracting page count: {e}")
-            return 0
-    
-    def determine_access_level(self, html: str) -> Tuple[str, str]:
-        """
-        Determine document access level by analyzing HTML.
-        Returns: (access_level, reason)
-        
-        Checks for:
-        - "Free document" indicators
-        - "Public" labels
-        - Paywall/lock indicators (private/paid)
-        """
+        return 0
+
+    @staticmethod
+    def _pc_ld_json(_t: str, soup: BeautifulSoup) -> int:
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string)
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if isinstance(item, dict):
+                        for key in ("numberOfPages", "pageCount", "page_count"):
+                            if key in item:
+                                return int(item[key])
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _pc_text_patterns(text: str, _s: BeautifulSoup) -> int:
+        for pat in (
+            r"(\d+)\s+(?:pages?|Pages?|PAGES)",
+            r"(?:pages?|Pages?)\s*:\s*(\d+)",
+            r"of\s+(\d+)\s+pages",
+        ):
+            m = re.search(pat, text)
+            if m:
+                val = int(m.group(1))
+                if 1 < val < 10_000:
+                    return val
+        return 0
+
+    # ── Image URL extraction ──────────────────────────────────────────────
+
+    async def extract_image_urls(self, meta: dict) -> list[str]:
+        raw = meta["_html"]
+        soup = meta["_soup"]
+        doc_id = meta["doc_id"]
+        urls: list[str] = []
+
+        cdn_pats = [
+            re.compile(
+                r"(https?://html\d*\.scribdassets\.com/"
+                r'[a-zA-Z0-9_-]+/images/[^"\'\\\s<>]+\.'
+                r"(?:jpg|png|webp))",
+                re.I,
+            ),
+            re.compile(
+                r"(https?://imgv2-\d+-shm-\w+\.scribdassets\.com/"
+                r'img/[^"\'\\\s<>]+)',
+                re.I,
+            ),
+            re.compile(
+                r"(https?://[^\s\"'<>]*scribdassets\.com"
+                r'[^\s"\'<>]*\.(?:jpg|png|webp))',
+                re.I,
+            ),
+        ]
+        seen: set[str] = set()
+        for pat in cdn_pats:
+            for m in pat.finditer(raw):
+                u = m.group(1).split("?")[0]
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+
+        if not urls:
+            urls = self._images_from_json(raw)
+
+        if not urls:
+            urls = await self._images_from_read_api(doc_id, raw)
+
+        if not urls and meta["page_count"] > 0:
+            urls = await self._probe_cdn(raw, meta["page_count"])
+
+        urls = list(dict.fromkeys(self._upscale(u) for u in urls))
+        return urls
+
+    @staticmethod
+    def _upscale(url: str) -> str:
+        url = re.sub(r"/\d+x\d+/", "/original/", url)
+        url = re.sub(r"[?&]w=\d+", "", url)
+        url = re.sub(r"[?&]h=\d+", "", url)
+        url = re.sub(r"-\d+x\d+\.", ".", url)
+        return url
+
+    @staticmethod
+    def _images_from_json(text: str) -> list[str]:
+        urls: list[str] = []
+
+        def _walk(obj: object, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    if (
+                        isinstance(v, str)
+                        and "scribdassets.com" in v
+                        and any(v.lower().endswith(e) for e in (".jpg", ".png", ".webp"))
+                    ):
+                        urls.append(v.split("?")[0])
+                    else:
+                        _walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item, depth + 1)
+
+        for block in re.findall(r"\{[^{}]{100,}\}", text)[:50]:
+            try:
+                _walk(json.loads(block))
+            except Exception:
+                pass
+        return urls
+
+    async def _images_from_read_api(self, doc_id: str, text: str) -> list[str]:
+        ak = re.search(r'"access_key"\s*:\s*"([^"]+)"', text)
+        if not ak:
+            return []
+        api = (
+            f"https://www.scribd.com/doc-page/read-data"
+            f"?doc_id={doc_id}&access_key={ak.group(1)}"
+        )
+        urls: list[str] = []
         try:
-            soup = BeautifulSoup(html, 'html.parser')
-            html_lower = html.lower()
-            
-            # Check for free/public indicators
-            free_indicators = [
-                'free document',
-                'free preview',
-                'public document',
-                'publicly shared',
-                'author has shared',
-                'this document is free',
-                'no cost',
-                'available for free',
-            ]
-            
-            for indicator in free_indicators:
-                if indicator in html_lower:
-                    logger.info(f"✅ Found free indicator: {indicator}")
-                    return 'free', f"Found: {indicator}"
-            
-            # Check for paywall/private indicators
-            paid_indicators = [
-                'unlock document',
-                'requires premium',
-                'private document',
-                'locked document',
-                'premium content',
-                'subscription required',
-                'pay to view',
-                'this document is private',
-            ]
-            
-            for indicator in paid_indicators:
-                if indicator in html_lower:
-                    logger.info(f"🔒 Found access restriction: {indicator}")
-                    return 'paid', f"Access restricted: {indicator}"
-            
-            # Check meta tags for access information
-            for meta in soup.find_all('meta'):
-                name = meta.get('name', '').lower()
-                content = meta.get('content', '').lower()
-                
-                if 'public' in name or 'access' in name:
-                    if 'free' in content or 'public' in content:
-                        return 'free', "Meta tag indicates free access"
-                    elif 'private' in content or 'paid' in content:
-                        return 'paid', "Meta tag indicates restricted access"
-            
-            # Default to unknown
-            logger.warning("⚠️ Could not determine access level")
-            return 'unknown', "Access level unclear from metadata"
-        
-        except Exception as e:
-            logger.error(f"❌ Error determining access level: {e}")
-            return 'unknown', f"Error: {str(e)}"
-    
-    async def extract_metadata(self, url: str) -> ScribdDocument:
-        """
-        Extract public metadata from a Scribd document.
-        Only proceeds if document is marked as public/free.
-        """
-        doc_id = self.extract_doc_id(url)
-        if not doc_id:
-            return ScribdDocument(
-                doc_id="unknown",
-                title="Unknown",
-                author="Unknown",
-                page_count=0,
-                description="",
-                access_level="unknown",
-                url=url,
-                error="Invalid Scribd URL format"
+            resp = await self._get_text(
+                api,
+                extra_headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"https://www.scribd.com/document/{doc_id}",
+                },
             )
-        
-        # Fetch HTML
-        html = await self.fetch_html(url)
-        if not html:
-            return ScribdDocument(
-                doc_id=doc_id,
-                title="Unknown",
-                author="Unknown",
-                page_count=0,
-                description="",
-                access_level="unknown",
-                url=url,
-                error="Could not fetch page content"
-            )
-        
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Extract title
-        title = "Unknown Document"
-        title_tag = soup.find('h1', class_=re.compile('document.*title', re.IGNORECASE))
-        if not title_tag:
-            title_tag = soup.find('title')
-        if title_tag:
-            title = title_tag.get_text(strip=True)
-        
-        # Extract author
-        author = "Unknown Author"
-        author_tag = soup.find('a', class_=re.compile('author', re.IGNORECASE))
-        if not author_tag:
-            author_tag = soup.find('span', class_=re.compile('author', re.IGNORECASE))
-        if author_tag:
-            author = author_tag.get_text(strip=True)
-        
-        # Extract description
-        description = ""
-        desc_tag = soup.find('meta', {'name': 'description'})
-        if desc_tag:
-            description = desc_tag.get('content', '')
-        
-        # Extract page count
-        page_count = self.extract_page_count_from_html(html)
-        
-        # Determine access level
-        access_level, access_reason = self.determine_access_level(html)
-        
-        # Create document object
-        doc = ScribdDocument(
-            doc_id=doc_id,
-            title=title,
-            author=author,
-            page_count=page_count,
-            description=description,
-            access_level=access_level,
-            url=url,
-            is_downloadable=access_level in ['free', 'public']
-        )
-        
-        logger.info(f"📊 Extracted metadata: {title} ({page_count} pages, Access: {access_level})")
-        return doc
+            self._images_from_json.__func__(resp)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return urls
 
-extractor = ScribdMetadataExtractor()
+    async def _probe_cdn(self, text: str, page_count: int) -> list[str]:
+        base_m = re.search(r"scribdassets\.com/([a-zA-Z0-9_-]{10,})/", text)
+        if not base_m:
+            return []
+        base = f"https://html.scribdassets.com/{base_m.group(1)}/images"
+        templates = ["{base}/{num:04d}.jpg", "{base}/page-{num}.jpg"]
+        for tmpl in templates:
+            test = tmpl.format(base=base, num=1)
+            try:
+                async with self.session.head(
+                    test,
+                    headers=BROWSER_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    allow_redirects=True,
+                    ssl=False,
+                ) as r:
+                    if r.status == 200:
+                        return [
+                            tmpl.format(base=base, num=p)
+                            for p in range(1, page_count + 1)
+                        ]
+            except Exception:
+                pass
+        return []
+
+    # ── Download page images concurrently ─────────────────────────────────
+
+    async def download_images(
+        self, urls: list[str], progress_cb=None
+    ) -> list[bytes]:
+        sem = asyncio.Semaphore(6)
+        results: list[tuple[int, bytes | None]] = []
+
+        async def _grab(idx: int, url: str) -> None:
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        data = await self._get_bytes(
+                            url, extra_headers={"Referer": "https://www.scribd.com/"}
+                        )
+                        if len(data) > 500:
+                            results.append((idx, data))
+                            if progress_cb:
+                                await progress_cb(idx + 1, len(urls))
+                            return
+                    except Exception:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                results.append((idx, None))
+
+        await asyncio.gather(*(_grab(i, u) for i, u in enumerate(urls)))
+        results.sort(key=lambda x: x[0])
+        return [d for _, d in results if d]
+
+    # ── Conversions ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def images_to_pdf(blobs: list[bytes]) -> bytes:
+        imgs: list[Image.Image] = []
+        for b in blobs:
+            try:
+                im = Image.open(io.BytesIO(b))
+                if im.mode in ("RGBA", "P", "LA"):
+                    im = im.convert("RGB")
+                imgs.append(im)
+            except Exception:
+                pass
+        if not imgs:
+            raise ValueError("No valid images to create PDF")
+        buf = io.BytesIO()
+        first, *rest = imgs
+        first.save(buf, "PDF", save_all=True, append_images=rest, resolution=150)
+        return buf.getvalue()
+
+    @staticmethod
+    def images_to_zip(blobs: list[bytes], title: str = "document") -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, data in enumerate(blobs, 1):
+                ext = "png" if data[:4] == b"\x89PNG" else "jpg"
+                zf.writestr(f"{title}_page_{idx:04d}.{ext}", data)
+        return buf.getvalue()
+
+    # ── Text / HTML extraction ────────────────────────────────────────────
+
+    async def extract_text(self, meta: dict) -> str:
+        soup: BeautifulSoup = meta["_soup"]
+        parts: list[str] = []
+
+        for cls_re in (
+            r"text_layer|text-layer|page_text",
+            r"page_content|doc_page|reader_page|page_inner",
+        ):
+            for el in soup.find_all(class_=re.compile(cls_re, re.I)):
+                t = el.get_text("\n", strip=True)
+                if t and len(t) > 20:
+                    parts.append(t)
+            if parts:
+                break
+
+        if not parts:
+            parts = self._text_from_json(meta["_html"])
+
+        if not parts:
+            for sel in ("article", "main", ".document_content", "#document_column"):
+                el = soup.select_one(sel)
+                if el:
+                    t = el.get_text("\n", strip=True)
+                    if len(t) > 50:
+                        parts.append(t)
+                        break
+
+        return "\n\n--- Page Break ---\n\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _text_from_json(text: str) -> list[str]:
+        out: list[str] = []
+        for pat in (
+            r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'"page_text"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        ):
+            for m in re.finditer(pat, text):
+                try:
+                    decoded = m.group(1).encode().decode("unicode_escape")
+                    cleaned = re.sub(r"<[^>]+>", "", decoded).strip()
+                    if len(cleaned) > 30:
+                        out.append(cleaned)
+                except Exception:
+                    pass
+        return out
+
+    async def build_html(self, meta: dict) -> str:
+        title = html_mod.escape(meta["title"])
+        author = html_mod.escape(meta["author"])
+        raw_text = await self.extract_text(meta)
+        body = ""
+        if raw_text:
+            for block in raw_text.split("\n\n--- Page Break ---\n\n"):
+                body += "<div class='page'>\n"
+                for line in block.strip().splitlines():
+                    if line.strip():
+                        body += f"  <p>{html_mod.escape(line.strip())}</p>\n"
+                body += "</div>\n<hr>\n"
+        else:
+            body = (
+                "<p><em>Text could not be extracted from this document. "
+                "Try the PDF or Images format instead.</em></p>"
+            )
+
+        return (
+            "<!DOCTYPE html>\n<html lang='en'>\n<head>\n"
+            "  <meta charset='UTF-8'>\n"
+            "  <meta name='viewport' content='width=device-width,initial-scale=1'>\n"
+            f"  <title>{title}</title>\n"
+            "  <style>\n"
+            "    body{font-family:Georgia,serif;max-width:800px;margin:2rem auto;"
+            "padding:0 1rem;line-height:1.8;color:#222}\n"
+            "    h1{font-size:1.8rem;border-bottom:2px solid #333;padding-bottom:.5rem}\n"
+            "    .meta{color:#666;font-style:italic;margin-bottom:2rem}\n"
+            "    .page{margin:1.5rem 0} hr{border:none;border-top:1px solid #ddd;"
+            "margin:2rem 0}\n"
+            "    p{margin:.5rem 0;text-align:justify}\n"
+            "  </style>\n</head>\n<body>\n"
+            f"  <h1>{title}</h1>\n"
+            f"  <div class='meta'>Author: {author} | "
+            f"Pages: {meta['page_count']}</div>\n"
+            f"  {body}\n"
+            "</body>\n</html>"
+        )
+
+    # ── Third-party bypass engines ────────────────────────────────────────
+
+    async def bypass_download_pdf(self, doc_id: str, doc_url: str) -> bytes | None:
+        for gw in self.BYPASS_GATEWAYS:
+            try:
+                logger.info("Trying bypass via %s …", gw["name"])
+                pdf = await self._try_gateway(gw, doc_id, doc_url)
+                if pdf and len(pdf) > 5000:
+                    logger.info("Bypass via %s succeeded (%d bytes)", gw["name"], len(pdf))
+                    return pdf
+            except Exception as exc:
+                logger.warning("Bypass %s failed: %s", gw["name"], exc)
+        return None
+
+    async def _try_gateway(
+        self, gw: dict, doc_id: str, doc_url: str
+    ) -> bytes | None:
+        payload = {"url": doc_url, "doc_id": doc_id}
+        kw: dict = dict(
+            headers={**BROWSER_HEADERS, "Referer": gw["url"]},
+            timeout=aiohttp.ClientTimeout(total=60),
+            ssl=False,
+        )
+        if gw["method"] == "post":
+            req = self.session.post(gw["url"], data=payload, **kw)
+        else:
+            req = self.session.get(gw["url"], params={"url": doc_url}, **kw)
+
+        async with req as r:
+            ct = r.headers.get("Content-Type", "")
+            if "pdf" in ct or "octet-stream" in ct:
+                return await r.read()
+            body = await r.text()
+            link = self._find_download_link(body)
+            if link:
+                return await self._get_bytes(link)
+        return None
+
+    @staticmethod
+    def _find_download_link(text: str) -> str | None:
+        try:
+            data = json.loads(text)
+            for k in ("download_url", "downloadUrl", "url", "link", "file"):
+                if k in data:
+                    return str(data[k])
+        except Exception:
+            pass
+        m = re.search(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', text)
+        if m:
+            return m.group(1)
+        m = re.search(r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)', text)
+        return m.group(1) if m else None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🤖 TELEGRAM BOT HANDLERS
+# DECORATORS
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    user = update.effective_user
-    is_owner = user.id == OWNER_ID
-    is_authorized = db.is_authorized(user.id)
-    
-    if is_owner:
-        welcome_text = (
-            f"🚀 *Welcome, Owner {user.first_name}!*\n\n"
-            f"👑 *Admin Mode Active*\n"
-            f"┌─ /add_user `[ID]` - Authorize user\n"
-            f"├─ /remove_user `[ID]` - Revoke access\n"
-            f"├─ /users - List all users\n"
-            f"├─ /broadcast `[msg]` - Send to all users\n"
-            f"└─ /stats - View statistics\n\n"
-            f"📚 *Regular Features*\n"
-            f"• Send Scribd link to research\n"
-            f"• View public metadata\n"
-            f"• Download if public/free\n"
-        )
-    elif is_authorized:
-        welcome_text = (
-            f"⚡ *Welcome, {user.first_name}!*\n\n"
-            f"📚 *Scribd Research Tool*\n"
-            f"1. Send a Scribd document link\n"
-            f"2. View public metadata\n"
-            f"3. Download if marked Public/Free\n\n"
-            f"📋 *What we extract:*\n"
-            f"• Document title & author\n"
-            f"• Page count\n"
-            f"• Description\n"
-            f"• Access level"
-        )
-    else:
-        welcome_text = (
-            f"❌ *Access Denied*\n\n"
-            f"Sorry {user.first_name}, you're not authorized.\n"
-            f"Contact the owner for access.\n\n"
-            f"Your ID: `{user.id}`"
-        )
-    
-    await update.message.reply_text(
-        welcome_text,
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True
-    )
 
-async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Scribd links sent by users."""
-    user_id = update.effective_user.id
-    
-    if not db.is_authorized(user_id):
-        await update.message.reply_text(
-            "❌ You're not authorized to use this bot.\n"
-            "Contact the owner for access."
-        )
-        return
-    
-    text = update.message.text
-    if "scribd" not in text.lower():
-        return
-    
-    # Extract Scribd URL
-    urls = re.findall(r'https?://(?:www\.)?scribd\.com/(?:document|doc)/\d+[^\s]*', text, re.IGNORECASE)
-    if not urls:
-        await update.message.reply_text("❌ No valid Scribd link found in your message.")
-        return
-    
-    url = urls[0]
-    
-    # Show processing message
-    status_msg = await update.message.reply_text(
-        "🔄 *Analyzing document...* Fetching metadata...",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    try:
-        # Extract metadata
-        await status_msg.edit_text(
-            "🔍 *Extracting metadata...*\n"
-            "📄 Title | 👤 Author | 📊 Pages",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        doc = await extractor.extract_metadata(url)
-        
-        if doc.error:
-            await status_msg.edit_text(f"❌ Error: {doc.error}")
+def auth_required(func):
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not user_mgr.is_authorized(uid):
+            await update.message.reply_text(
+                "❌ <b>Access Denied</b>\n\n"
+                "You are not authorized. Contact the bot owner.",
+                parse_mode=ParseMode.HTML,
+            )
             return
-        
-        # Create response text
-        access_emoji = "✅" if doc.is_accessible() else "🔒"
-        
-        info_text = (
-            f"{access_emoji} *Document Found!*\n\n"
-            f"📌 *Title:* {doc.title}\n"
-            f"👤 *Author:* {doc.author}\n"
-            f"📄 *Pages:* {doc.page_count if doc.page_count > 0 else 'Unknown'}\n"
-            f"🔐 *Access:* {doc.access_level.title()}\n\n"
+        return await func(update, ctx)
+
+    return wrapper
+
+
+def owner_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != OWNER_ID:
+            await update.message.reply_text("❌ Owner-only command.")
+            return
+        return await func(update, ctx)
+
+    return wrapper
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOWNLOAD LOGIC (per-format)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_safe_fn = re.compile(r"[^\w\s-]")
+_pending: dict[int, dict] = {}
+
+
+def _filename(title: str) -> str:
+    return _safe_fn.sub("", title)[:60].strip() or "document"
+
+
+def _progress_bar(pct: int) -> str:
+    filled = pct // 10
+    return "█" * filled + "░" * (10 - filled)
+
+
+async def _send_pdf(query, scraper: ScribdScraper, meta: dict):
+    doc_id, doc_url = meta["doc_id"], meta["url"]
+
+    await query.edit_message_text(
+        "🔄 <b>Bypassing Paywall…</b>\n\n⚡ Trying bypass engines…",
+        parse_mode=ParseMode.HTML,
+    )
+    pdf = await scraper.bypass_download_pdf(doc_id, doc_url)
+
+    if not pdf:
+        await query.edit_message_text(
+            "🔄 <b>Direct bypass unavailable</b>\n\n"
+            "📦 Falling back to page-image extraction…",
+            parse_mode=ParseMode.HTML,
         )
-        
-        if doc.description:
-            info_text += f"📝 *Description:*\n{doc.description[:200]}...\n\n"
-        
-        # Create action buttons
-        if doc.is_accessible():
-            info_text += "✅ *This document is publicly accessible.*\n\n🎯 *Actions:*"
-            keyboard = [
+        urls = await scraper.extract_image_urls(meta)
+        if not urls:
+            await query.edit_message_text(
+                "❌ <b>Could not extract pages</b>\n\n"
+                "No downloadable page images found. Try TXT or HTML.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        total = len(urls)
+
+        async def _prog(cur: int, tot: int):
+            if cur % max(1, tot // 5) == 0 or cur == tot:
+                pct = int(cur / tot * 100)
+                try:
+                    await query.edit_message_text(
+                        f"📦 <b>Extracting {tot} Pages…</b>\n\n"
+                        f"[{_progress_bar(pct)}] {pct}%\n"
+                        f"📄 Page {cur}/{tot}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
+        blobs = await scraper.download_images(urls, progress_cb=_prog)
+        if not blobs:
+            await query.edit_message_text(
+                "❌ <b>Image download failed</b>", parse_mode=ParseMode.HTML
+            )
+            return
+
+        await query.edit_message_text(
+            f"📦 <b>Converting {len(blobs)} pages to PDF…</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        pdf = scraper.images_to_pdf(blobs)
+
+    name = _filename(meta["title"])
+    size_mb = len(pdf) / 1024 / 1024
+    await query.edit_message_text(
+        f"📤 <b>Sending PDF…</b>  ({size_mb:.1f} MB)", parse_mode=ParseMode.HTML
+    )
+    await query.message.reply_document(
+        document=io.BytesIO(pdf),
+        filename=f"{name}.pdf",
+        caption=(
+            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
+            f"✍️ {html_mod.escape(meta['author'])} · "
+            f"📄 {meta['page_count']} pages · 📕 PDF\n\n"
+            "⚡ <i>Scribd Bypass Bot</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.edit_message_text(
+        f"✅ <b>PDF sent!</b>\n📖 {html_mod.escape(meta['title'])}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _send_txt(query, scraper: ScribdScraper, meta: dict):
+    await query.edit_message_text(
+        "📦 <b>Extracting text…</b>", parse_mode=ParseMode.HTML
+    )
+    text = await scraper.extract_text(meta)
+    if not text or len(text.strip()) < 50:
+        await query.edit_message_text(
+            "❌ <b>Text extraction failed</b>\n\n"
+            "This may be a scanned/image-only document.\n"
+            "Try PDF or Images format.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    header = (
+        f"{'=' * 60}\n{meta['title']}\n"
+        f"Author: {meta['author']}\nPages: {meta['page_count']}\n{'=' * 60}\n\n"
+    )
+    full = header + text
+    name = _filename(meta["title"])
+    await query.message.reply_document(
+        document=io.BytesIO(full.encode()),
+        filename=f"{name}.txt",
+        caption=(
+            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
+            f"📝 TXT · {len(full):,} chars\n\n"
+            "⚡ <i>Scribd Bypass Bot</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.edit_message_text(
+        f"✅ <b>Text sent!</b>\n📝 {len(full):,} characters",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _send_html(query, scraper: ScribdScraper, meta: dict):
+    await query.edit_message_text(
+        "📦 <b>Building HTML…</b>", parse_mode=ParseMode.HTML
+    )
+    content = await scraper.build_html(meta)
+    name = _filename(meta["title"])
+    await query.message.reply_document(
+        document=io.BytesIO(content.encode()),
+        filename=f"{name}.html",
+        caption=(
+            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
+            f"🌐 HTML · {len(content) / 1024:.1f} KB\n\n"
+            "⚡ <i>Scribd Bypass Bot</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.edit_message_text(
+        f"✅ <b>HTML sent!</b>\n🌐 {html_mod.escape(meta['title'])}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _send_images(query, scraper: ScribdScraper, meta: dict):
+    await query.edit_message_text(
+        "🔄 <b>Extracting image URLs…</b>", parse_mode=ParseMode.HTML
+    )
+    urls = await scraper.extract_image_urls(meta)
+    if not urls:
+        await query.edit_message_text(
+            "❌ <b>No page images found</b>\nTry PDF or TXT.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total = len(urls)
+
+    async def _prog(cur: int, tot: int):
+        if cur % max(1, tot // 5) == 0 or cur == tot:
+            pct = int(cur / tot * 100)
+            try:
+                await query.edit_message_text(
+                    f"📦 <b>Downloading High-Res Images…</b>\n\n"
+                    f"[{_progress_bar(pct)}] {pct}%\n"
+                    f"🖼 Image {cur}/{tot}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+    blobs = await scraper.download_images(urls, progress_cb=_prog)
+    if not blobs:
+        await query.edit_message_text(
+            "❌ <b>Image download failed</b>", parse_mode=ParseMode.HTML
+        )
+        return
+
+    await query.edit_message_text(
+        f"📤 <b>Packaging {len(blobs)} images into ZIP…</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    name = _filename(meta["title"])
+    zipdata = scraper.images_to_zip(blobs, title=name)
+    await query.message.reply_document(
+        document=io.BytesIO(zipdata),
+        filename=f"{name}_images.zip",
+        caption=(
+            f"✅ <b>{html_mod.escape(meta['title'])}</b>\n"
+            f"🖼 {len(blobs)} high-res images · "
+            f"{len(zipdata) / 1024 / 1024:.1f} MB\n\n"
+            "⚡ <i>Scribd Bypass Bot</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.edit_message_text(
+        f"✅ <b>Images ZIP sent!</b>\n🖼 {len(blobs)} pages",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TELEGRAM COMMAND & MESSAGE HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(
+        f"🚀 <b>Scribd Paywall Bypass Downloader</b>\n\n"
+        f"Welcome, {html_mod.escape(u.first_name)}!\n\n"
+        f"📥 <b>How to use:</b>\n"
+        f"Send any Scribd document URL and I'll bypass the paywall.\n\n"
+        f"⚡ <b>Formats:</b>\n"
+        f"  📕 PDF — full document\n"
+        f"  📝 TXT — extracted plain text\n"
+        f"  🌐 HTML — formatted web page\n"
+        f"  🖼 Images — high-res pages (ZIP)\n\n"
+        f"📋 <b>Commands:</b>\n"
+        f"  /start  — this message\n"
+        f"  /help   — detailed help\n"
+        f"  /status — bot status\n\n"
+        f"<i>Your ID: <code>{u.id}</code></i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    is_owner = update.effective_user.id == OWNER_ID
+    owner_block = ""
+    if is_owner:
+        owner_block = (
+            "\n\n👑 <b>Owner Commands:</b>\n"
+            "  /add_user <code>[ID]</code> — authorize user\n"
+            "  /remove_user <code>[ID]</code> — revoke access\n"
+            "  /users — list authorized users\n"
+            "  /broadcast <code>[msg]</code> — message all users"
+        )
+    await update.message.reply_text(
+        "📖 <b>Help — Scribd Bypass Downloader</b>\n\n"
+        "<b>1.</b> Copy a Scribd URL, e.g.:\n"
+        "<code>https://www.scribd.com/document/123456/Title</code>\n\n"
+        "<b>2.</b> Paste it here.\n\n"
+        "<b>3.</b> Pick a format from the buttons.\n\n"
+        "<b>4.</b> Wait — the bot tries multiple bypass engines.\n\n"
+        "⚡ Uses fallback image-scrape → PDF conversion when direct "
+        "bypass is unavailable."
+        f"{owner_block}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@auth_required
+async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ <b>Bot Status: Online</b>\n\n"
+        f"👥 Authorized users: {len(user_mgr.all_ids)}\n"
+        f"📊 Pending downloads: {len(_pending)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@owner_only
+async def cmd_add_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/add_user ID [ID …]</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines: list[str] = []
+    for arg in ctx.args:
+        try:
+            uid = int(arg)
+            if user_mgr.add(uid):
+                lines.append(f"✅ <code>{uid}</code> authorized")
+            else:
+                lines.append(f"ℹ️ <code>{uid}</code> already authorized")
+        except ValueError:
+            lines.append(f"❌ Invalid: <code>{arg}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@owner_only
+async def cmd_remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/remove_user ID [ID …]</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines: list[str] = []
+    for arg in ctx.args:
+        try:
+            uid = int(arg)
+            if user_mgr.remove(uid):
+                lines.append(f"✅ <code>{uid}</code> removed")
+            else:
+                lines.append(f"❌ <code>{uid}</code> — owner or not found")
+        except ValueError:
+            lines.append(f"❌ Invalid: <code>{arg}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@owner_only
+async def cmd_users(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    ids = user_mgr.all_ids
+    listing = "\n".join(
+        f"  {'👑' if u == OWNER_ID else '👤'} <code>{u}</code>" for u in ids
+    )
+    await update.message.reply_text(
+        f"👥 <b>Authorized Users ({len(ids)}):</b>\n\n{listing}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@owner_only
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/broadcast message text</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    msg = " ".join(ctx.args)
+    sent = failed = 0
+    for uid in user_mgr.all_ids:
+        try:
+            await ctx.bot.send_message(
+                uid,
+                f"📢 <b>Broadcast</b>\n\n{html_mod.escape(msg)}",
+                parse_mode=ParseMode.HTML,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(
+        f"📢 Done — ✅ {sent} sent, ❌ {failed} failed"
+    )
+
+
+# ── URL handler ───────────────────────────────────────────────────────────
+
+
+@auth_required
+async def handle_url(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    doc_id_match = SCRIBD_URL_RE.search(text)
+    if not doc_id_match:
+        return
+    doc_id = doc_id_match.group(1)
+
+    status = await update.message.reply_text(
+        "🔄 <b>Analyzing document…</b>\n⏳ Fetching metadata from Scribd…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            scraper = ScribdScraper(sess)
+            meta = await scraper.get_metadata(doc_id)
+
+        _pending[update.effective_user.id] = {"meta": meta, "url": text}
+
+        kb = InlineKeyboardMarkup(
+            [
                 [
-                    InlineKeyboardButton("📖 View Info", callback_data=f"info_{doc.doc_id}"),
-                    InlineKeyboardButton("🔗 Open URL", url=url),
+                    InlineKeyboardButton("📕 PDF", callback_data=f"dl:pdf:{doc_id}"),
+                    InlineKeyboardButton("📝 TXT", callback_data=f"dl:txt:{doc_id}"),
                 ],
                 [
-                    InlineKeyboardButton("💾 Save Metadata", callback_data=f"save_{doc.doc_id}"),
-                ]
+                    InlineKeyboardButton("🌐 HTML", callback_data=f"dl:html:{doc_id}"),
+                    InlineKeyboardButton(
+                        "🖼 Images (ZIP)", callback_data=f"dl:img:{doc_id}"
+                    ),
+                ],
             ]
-        else:
-            info_text += "🔒 *This document is private or paid.*\n\n"
-            info_text += "⚠️ *Only public/free documents can be accessed.*\n\n"
-            keyboard = [
-                [
-                    InlineKeyboardButton("ℹ️ View Info", callback_data=f"info_{doc.doc_id}"),
-                    InlineKeyboardButton("🔗 Open on Scribd", url=url),
-                ]
-            ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await status_msg.edit_text(
-            info_text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
         )
-        
-        # Store document info temporarily
-        context.user_data[f"doc_{doc.doc_id}"] = doc
-    
-    except Exception as e:
-        logger.error(f"❌ Link handler error: {e}")
-        await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
 
-async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle document info request."""
+        pg = (
+            f"📄 Pages: <b>{meta['page_count']}</b>"
+            if meta["page_count"]
+            else "📄 Pages: <i>detecting…</i>"
+        )
+        desc = ""
+        if meta.get("description"):
+            desc = (
+                f"\n📝 {html_mod.escape(meta['description'][:150])}…"
+            )
+
+        await status.edit_text(
+            f"✅ <b>Document Found!</b>\n\n"
+            f"📖 <b>{html_mod.escape(meta['title'])}</b>\n"
+            f"✍️ {html_mod.escape(meta['author'])}\n"
+            f"{pg}\n"
+            f"🔗 ID: <code>{doc_id}</code>"
+            f"{desc}\n\n"
+            f"⚡ Select download format:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+    except Exception as exc:
+        logger.error("Metadata fetch failed: %s", exc, exc_info=True)
+        await status.edit_text(
+            f"❌ <b>Error</b>\n<code>{html_mod.escape(str(exc)[:200])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── Callback (format selection) ──────────────────────────────────────────
+
+_FMT_DISPATCH = {
+    "pdf": _send_pdf,
+    "txt": _send_txt,
+    "html": _send_html,
+    "img": _send_images,
+}
+
+_FMT_LABELS = {
+    "pdf": "📕 PDF",
+    "txt": "📝 TXT",
+    "html": "🌐 HTML",
+    "img": "🖼 Images",
+}
+
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
-    
-    if not db.is_authorized(user_id):
-        await query.answer("❌ Access denied", show_alert=True)
-        return
-    
-    doc_id = query.data.split('_')[1]
-    doc = context.user_data.get(f"doc_{doc_id}")
-    
-    if not doc:
-        await query.answer("Document info not found", show_alert=True)
-        return
-    
-    detailed_text = (
-        f"📊 *Document Details*\n\n"
-        f"🆔 *ID:* `{doc.doc_id}`\n"
-        f"📌 *Title:* {doc.title}\n"
-        f"👤 *Author:* {doc.author}\n"
-        f"📄 *Pages:* {doc.page_count if doc.page_count > 0 else 'Not detected'}\n"
-        f"🔐 *Access Level:* {doc.access_level.upper()}\n"
-        f"🌐 *Downloadable:* {'Yes ✅' if doc.is_downloadable else 'No ❌'}\n\n"
-        f"📝 *Description:*\n{doc.description if doc.description else 'No description'}"
-    )
-    
     await query.answer()
-    await query.message.edit_text(
-        detailed_text,
-        parse_mode=ParseMode.MARKDOWN
+
+    uid = query.from_user.id
+    if not user_mgr.is_authorized(uid):
+        await query.answer("❌ Not authorized", show_alert=True)
+        return
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "dl":
+        return
+    fmt, doc_id = parts[1], parts[2]
+
+    info = _pending.get(uid)
+    if not info:
+        await query.edit_message_text("❌ Session expired — send the URL again.")
+        return
+
+    meta = info["meta"]
+    label = _FMT_LABELS.get(fmt, fmt.upper())
+    await query.edit_message_text(
+        f"🔄 <b>Bypassing Paywall…</b>\n\n"
+        f"📖 {html_mod.escape(meta['title'])}\n"
+        f"📦 Format: {label}\n\n⏳ Please wait…",
+        parse_mode=ParseMode.HTML,
     )
 
-async def save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save document metadata to file."""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    if not db.is_authorized(user_id):
-        await query.answer("❌ Access denied", show_alert=True)
+    handler = _FMT_DISPATCH.get(fmt)
+    if not handler:
+        await query.edit_message_text("❌ Unknown format.")
         return
-    
-    doc_id = query.data.split('_')[1]
-    doc = context.user_data.get(f"doc_{doc_id}")
-    
-    if not doc:
-        await query.answer("Document info not found", show_alert=True)
-        return
-    
+
     try:
-        # Create JSON metadata file
-        metadata = {
-            "doc_id": doc.doc_id,
-            "title": doc.title,
-            "author": doc.author,
-            "pages": doc.page_count,
-            "access_level": doc.access_level,
-            "url": doc.url,
-            "description": doc.description,
-            "extracted_at": datetime.now().isoformat(),
-        }
-        
-        filename = f"scribd_metadata_{doc.doc_id}.json"
-        filepath = Path(SETTINGS["TEMP_DIR"]) / filename
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
-        
-        # Send file
-        with open(filepath, 'rb') as f:
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=InputFile(f, filename),
-                caption=f"📄 Metadata for: {doc.title}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        
-        await query.answer("✅ Metadata saved and sent!", show_alert=False)
-        
-        # Clean up temp file
-        filepath.unlink(missing_ok=True)
-    
-    except Exception as e:
-        logger.error(f"❌ Error saving metadata: {e}")
-        await query.answer(f"❌ Error: {str(e)}", show_alert=True)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 👑 ADMIN COMMANDS
-# ═══════════════════════════════════════════════════════════════════════════
-
-async def add_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add authorized user (Owner only)."""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Owner only command")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("📝 Usage: /add_user [User_ID]")
-        return
-    
-    try:
-        user_id = int(context.args[0])
-        if db.add_user(user_id):
-            total = len(db.get_users()) + 1  # +1 for owner
-            await update.message.reply_text(
-                f"✅ User {user_id} authorized!\n"
-                f"👥 Total users: {total}"
-            )
-        else:
-            await update.message.reply_text(f"⚠️ User {user_id} already authorized")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid User ID format")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-async def remove_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove authorized user (Owner only)."""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Owner only command")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("📝 Usage: /remove_user [User_ID]")
-        return
-    
-    try:
-        user_id = int(context.args[0])
-        if db.remove_user(user_id):
-            total = len(db.get_users()) + 1  # +1 for owner
-            await update.message.reply_text(
-                f"✅ User {user_id} removed\n"
-                f"👥 Total users: {total}"
-            )
-        else:
-            await update.message.reply_text(f"⚠️ User {user_id} not found")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid User ID format")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-async def list_users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all authorized users (Owner only)."""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Owner only command")
-        return
-    
-    users = db.get_users()
-    total = len(users) + 1  # +1 for owner
-    
-    if not users:
-        await update.message.reply_text(
-            f"👥 *Authorized Users:*\n\n"
-            f"👤 Owner: {OWNER_ID}\n"
-            f"📭 No additional users\n\n"
-            f"📊 Total: 1",
-            parse_mode=ParseMode.MARKDOWN
+        await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
+        async with aiohttp.ClientSession() as sess:
+            scraper = ScribdScraper(sess)
+            await handler(query, scraper, meta)
+    except Exception as exc:
+        logger.error("Download failed: %s", exc, exc_info=True)
+        await query.edit_message_text(
+            f"❌ <b>Download Failed</b>\n\n"
+            f"<code>{html_mod.escape(str(exc)[:300])}</code>\n\n"
+            "Try a different format or re-send the URL.",
+            parse_mode=ParseMode.HTML,
         )
-    else:
-        user_list = "\n".join([f"• {uid}" for uid in users])
-        await update.message.reply_text(
-            f"👥 *Authorized Users:*\n\n"
-            f"👑 Owner: {OWNER_ID}\n"
-            f"👤 *Added Users:*\n{user_list}\n\n"
-            f"📊 Total: {total}",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    finally:
+        _pending.pop(uid, None)
 
-async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send broadcast message to all users (Owner only)."""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Owner only command")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("📝 Usage: /broadcast [message]")
-        return
-    
-    message = " ".join(context.args)
-    users = db.get_users()
-    all_users = [OWNER_ID] + users
-    
-    status = await update.message.reply_text(
-        f"📡 *Broadcasting to {len(all_users)} users...*",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    sent_count = 0
-    failed_count = 0
-    
-    for user_id in all_users:
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📢 *Announcement from Owner:*\n\n{message}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            sent_count += 1
-        except Exception as e:
-            logger.error(f"Broadcast failed for {user_id}: {e}")
-            failed_count += 1
-    
-    await status.edit_text(
-        f"✅ *Broadcast Complete!*\n\n"
-        f"📤 Sent: {sent_count}\n"
-        f"❌ Failed: {failed_count}",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics (Owner only)."""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Owner only command")
-        return
-    
-    users = db.get_users()
-    total_users = len(users) + 1
-    
-    stats_text = (
-        f"📊 *Bot Statistics*\n\n"
-        f"👥 *Users:*\n"
-        f"├─ Owner: 1\n"
-        f"├─ Authorized: {len(users)}\n"
-        f"└─ Total: {total_users}\n\n"
-        f"📁 *Storage:*\n"
-        f"├─ Temp Dir: {SETTINGS['TEMP_DIR']}\n"
-        f"├─ User DB: {SETTINGS['DATA_FILE']}\n"
-        f"└─ Log File: scribd_research_bot.log\n\n"
-        f"⚙️ *Configuration:*\n"
-        f"├─ Request Timeout: {SETTINGS['REQUEST_TIMEOUT']}s\n"
-        f"└─ Max File Size: {SETTINGS['MAX_FILE_SIZE'] // (1024*1024)}MB\n\n"
-        f"🔍 *About:*\n"
-        f"└─ Legitimate public metadata research tool\n"
-        f"   Only processes free/public documents"
-    )
-    
-    await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help information."""
-    help_text = (
-        f"ℹ️ *Scribd Research Tool Help*\n\n"
-        f"📚 *What This Bot Does:*\n"
-        f"✓ Extracts public metadata from Scribd documents\n"
-        f"✓ Shows title, author, page count\n"
-        f"✓ Indicates access level (Public/Free/Private/Paid)\n"
-        f"✓ Only processes documents authors marked as public/free\n\n"
-        f"🚀 *How to Use:*\n"
-        f"1. Send a Scribd link: https://scribd.com/doc/123456\n"
-        f"2. Bot fetches public metadata\n"
-        f"3. View document information\n"
-        f"4. Save metadata as JSON\n\n"
-        f"🔐 *Privacy & Legal:*\n"
-        f"✓ Only reads publicly visible data\n"
-        f"✓ Respects author access controls\n"
-        f"✓ Does NOT bypass paywalls\n"
-        f"✓ Compliant with Scribd ToS\n"
-        f"✓ Legitimate research tool\n\n"
-        f"📝 *User Commands:*\n"
-        f"• /start - Welcome message\n"
-        f"• /help - This message\n"
-        f"• Send Scribd link - Analyze document\n\n"
-        f"👑 *Owner Commands:*\n"
-        f"• /add_user [ID] - Authorize user\n"
-        f"• /remove_user [ID] - Remove user\n"
-        f"• /users - List all users\n"
-        f"• /broadcast [msg] - Send announcement\n"
-        f"• /stats - View statistics"
-    )
-    
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🚀 BOT INITIALIZATION
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def main():
-    """Initialize and start bot."""
-    
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("❌ CRITICAL: BOT_TOKEN not configured!")
-        print("\n" + "="*70)
-        print("❌ SETUP REQUIRED")
-        print("="*70)
-        print("\n1. Get bot token: https://t.me/BotFather")
-        print("2. Get your ID: https://t.me/userinfobot")
-        print("3. Edit this script:")
-        print(f"   BOT_TOKEN = 'your_token'")
-        print(f"   OWNER_ID = your_id")
-        print("\n" + "="*70 + "\n")
+
+def main() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if BOT_TOKEN in ("YOUR_BOT_TOKEN_HERE", ""):
+        logger.error("Set BOT_TOKEN env var or edit the script.")
         return
-    
-    # Create application
+    if OWNER_ID == 0:
+        logger.warning("OWNER_ID is 0 — admin commands disabled.")
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Command handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("help", help_handler))
-    app.add_handler(CommandHandler("add_user", add_user_handler))
-    app.add_handler(CommandHandler("remove_user", remove_user_handler))
-    app.add_handler(CommandHandler("users", list_users_handler))
-    app.add_handler(CommandHandler("broadcast", broadcast_handler))
-    app.add_handler(CommandHandler("stats", stats_handler))
-    
-    # Message handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
-    
-    # Callback handlers
-    app.add_handler(CallbackQueryHandler(info_callback, pattern=r"^info_"))
-    app.add_handler(CallbackQueryHandler(save_callback, pattern=r"^save_"))
-    
-    # Error handler
-    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-        logger.error(f"Exception while handling an update: {context.error}")
-    
-    app.add_error_handler(error_handler)
-    
-    # Start bot
-    logger.info("🚀 Bot starting...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    
-    print("\n" + "="*70)
-    print("✅ SCRIBD RESEARCH TOOL - RUNNING")
-    print("="*70)
-    print(f"👤 Owner ID: {OWNER_ID}")
-    print(f"📁 Database: {SETTINGS['DATA_FILE']}")
-    print(f"📂 Temp Dir: {SETTINGS['TEMP_DIR']}")
-    print(f"⏱️  Timeout: {SETTINGS['REQUEST_TIMEOUT']}s")
-    print("="*70)
-    print("\n📚 Legitimate Public Metadata Research Tool")
-    print("✓ Only processes public/free documents")
-    print("✓ No paywall bypass - respects access controls")
-    print("✓ Full compliance with Scribd ToS\n")
-    print("Press Ctrl+C to stop\n")
-    
-    try:
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        logger.info("⏹️ Shutting down...")
-        await extractor.close_session()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("add_user", cmd_add_user))
+    app.add_handler(CommandHandler("remove_user", cmd_remove_user))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(SCRIBD_URL_RE),
+            handle_url,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^dl:"))
+
+    logger.info("🚀 Scribd Bypass Bot starting (owner=%s)…", OWNER_ID)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("❌ Bot stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
+    main()

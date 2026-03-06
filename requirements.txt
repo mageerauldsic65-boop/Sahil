@@ -1,21 +1,8 @@
-# Scribd Downloader Bot - Python Dependencies
-# Install with: pip install -r requirements.txt
+# Scribd Paywall Bypass Downloader Bot — Dependencies
+# Install: pip install -r requirements.txt
 
-# Core Telegram Bot Framework
-python-telegram-bot>=20.0,<21.0
-
-# Async HTTP Client
-aiohttp>=3.9.0,<4.0
-
-# Async File Operations
-aiofiles>=23.0.0,<24.0
-
-# Optional but Recommended
-# For PDF manipulation (if you want to add PDF splitting/merging)
-# PyPDF2>=3.0,<4.0
-
-# For image processing (if you want to add watermarks/compression)
-# Pillow>=10.0.0,<11.0
-
-# For colored terminal output
-# colorama>=0.4.6,<0.5
+python-telegram-bot[ext]>=20.0
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+Pillow>=10.0.0
+lxml>=5.0.0
