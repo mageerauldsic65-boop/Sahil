@@ -1,301 +1,212 @@
-# 🤖 SCRIBD DOWNLOADER BOT - SETUP GUIDE
+# Universal Document Downloader Bot — Setup Guide
 
-## 📋 Requirements
+## What it does
 
-- **Python 3.9+**
-- **pip** (Python package manager)
-- **Telegram Account** (for bot token)
-- **Linux/Termux/Windows** (cross-platform)
+A production-ready Telegram bot that accepts any public URL and:
+- Detects and downloads **PDF files** directly
+- Converts **image galleries** into a single PDF
+- Exports **ZIP archives** of all found assets (images, PDFs, docs)
+- Extracts **clean readable text** from any webpage
+- Saves a full **HTML snapshot** of the page
 
 ---
 
-## 🚀 Quick Start (5 minutes)
+## Requirements
 
-### Step 1️⃣: Get Your Bot Token
+| Runtime | Version |
+|---------|---------|
+| Python  | 3.11+   |
 
-1. Open Telegram and search for **@BotFather**
-2. Send `/start`
-3. Send `/newbot`
-4. Follow the prompts to create your bot
-5. Copy the **API Token** (looks like: `123456789:ABCdefGHIjklmnoPQRstuvWXYZabcdef`)
+---
 
-### Step 2️⃣: Get Your Telegram ID
+## Quick Start
 
-1. Search for **@userinfobot** in Telegram
-2. Send `/start`
-3. It will show your **ID** (e.g., `987654321`)
-4. Copy this number
+### 1. Get a Bot Token
 
-### Step 3️⃣: Install Dependencies
+Talk to [@BotFather](https://t.me/BotFather) on Telegram:
 
-```bash
-# Update pip
-python3 -m pip install --upgrade pip
-
-# Install required packages
-pip install python-telegram-bot aiohttp aiofiles --upgrade
-
-# Or for Termux:
-apt update && apt install python -y
-pip install python-telegram-bot aiohttp aiofiles
+```
+/newbot
 ```
 
-### Step 4️⃣: Configure the Bot
+Copy the token it gives you.
 
-Open `scribd_bot.py` with any text editor and find this section:
+---
+
+### 2. Find Your Telegram User ID
+
+Talk to [@userinfobot](https://t.me/userinfobot) — it replies with your numeric ID.
+
+---
+
+### 3. Configure the Bot
+
+Open `bot.py` and update the two lines near the top:
 
 ```python
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your token
-OWNER_ID = 123456789               # Replace with your ID
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+OWNER_ID: int  = int(os.getenv("OWNER_ID", "123456789"))
 ```
 
-**Example:**
+**Option A — Edit the file directly:**
+Replace `YOUR_BOT_TOKEN_HERE` with your token and `123456789` with your ID.
 
-```python
-BOT_TOKEN = "1234567890:ABCdefGHIjklmnoPQRstuvWXYZabcdef"
-OWNER_ID = 987654321
+**Option B — Use environment variables (recommended for VPS):**
+```bash
+export BOT_TOKEN="1234567890:ABCDefgh..."
+export OWNER_ID="987654321"
+python bot.py
 ```
 
-### Step 5️⃣: Run the Bot
+---
+
+### 4. Install Dependencies
+
+#### Ubuntu / Debian VPS
 
 ```bash
-python3 scribd_bot.py
+sudo apt update
+sudo apt install -y python3-dev libxml2-dev libxslt-dev libjpeg-dev python3-pip
+pip install -r requirements.txt
 ```
 
-You should see:
-
-```
-======================================================================
-✅ SCRIBD DOWNLOADER BOT RUNNING
-======================================================================
-👤 Owner ID: 987654321
-🗄️  User Database: bot_users.json
-📂 Temp Directory: /tmp/scribd_bot
-⏱️  Request Timeout: 30s
-======================================================================
-
-Press Ctrl+C to stop
-```
-
----
-
-## 📱 Using the Bot
-
-### For Owner (You)
-
-1. **Start the bot**: Send `/start` to get the welcome message
-2. **Manage users**: Use admin commands below
-3. **Download documents**: Send any Scribd link directly
-
-### Admin Commands
-
-| Command | Usage | Example |
-|---------|-------|---------|
-| `/add_user` | Add authorized user | `/add_user 987654321` |
-| `/remove_user` | Remove authorized user | `/remove_user 987654321` |
-| `/users` | List all authorized users | `/users` |
-| `/broadcast` | Send announcement to all users | `/broadcast Important update!` |
-| `/stats` | View bot statistics | `/stats` |
-
-### For Authorized Users
-
-1. Send a Scribd document link
-2. Bot shows: **Title**, **Author**, **Pages**
-3. Select format:
-   - 📄 **PDF** - Full document
-   - 📝 **TXT** - Text version
-   - 🌐 **HTML** - Web version
-   - 🖼️ **Images** - All pages as photos
-4. Download instantly!
-
----
-
-## ⚙️ Configuration & Settings
-
-Edit the `SETTINGS` dictionary in the script to customize:
-
-```python
-SETTINGS = {
-    "MAX_FILE_SIZE": 50 * 1024 * 1024,      # 50MB max
-    "REQUEST_TIMEOUT": 30,                   # 30 seconds
-    "IMAGE_QUALITY": 95,                     # PNG quality (1-100)
-    "TEMP_DIR": "/tmp/scribd_bot",          # Temp files location
-    "DATA_FILE": "bot_users.json",          # User database file
-    "LOG_LEVEL": logging.INFO,              # Log verbosity
-    "BATCH_SIZE": 10,                       # Images per media group
-}
-```
-
-### For Termux Users
-
-If using Termux on Android, adjust paths:
-
-```python
-SETTINGS = {
-    "TEMP_DIR": "/data/data/com.termux/files/home/scribd_bot_temp",
-    "DATA_FILE": "/data/data/com.termux/files/home/bot_users.json",
-    # ... rest of settings
-}
-```
-
----
-
-## 🔧 Troubleshooting
-
-### "❌ CRITICAL: BOT_TOKEN not configured!"
-
-**Fix:** Edit the script and replace:
-```python
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-```
-
-With your actual token from @BotFather.
-
----
-
-### "❌ Access denied. Not authorized."
-
-**Fix:** Make sure:
-1. Your OWNER_ID is correct
-2. You haven't removed yourself with `/remove_user`
-3. The `bot_users.json` file isn't corrupted (delete and restart)
-
----
-
-### "⏱️ Timeout downloading..."
-
-**Fix:**
-1. Increase timeout in SETTINGS:
-   ```python
-   "REQUEST_TIMEOUT": 60,  # Increase from 30
-   ```
-2. Check your internet connection
-3. Try a different Scribd link
-
----
-
-### "ModuleNotFoundError: No module named 'telegram'"
-
-**Fix:** Install dependencies:
-```bash
-pip install python-telegram-bot aiohttp aiofiles --upgrade
-```
-
-For Termux:
-```bash
-pip install python-telegram-bot aiohttp aiofiles --break-system-packages
-```
-
----
-
-### Bot crashes when downloading large documents
-
-**Fix:**
-1. Reduce `MAX_FILE_SIZE`:
-   ```python
-   "MAX_FILE_SIZE": 20 * 1024 * 1024,  # 20MB instead of 50MB
-   ```
-2. Limit image extraction:
-   - In the code, change `range(1, min(num_pages + 1, 51))` to `range(1, min(num_pages + 1, 30))`
-
----
-
-### "permission denied" on Termux
-
-**Fix:** Run with proper permissions:
-```bash
-chmod +x scribd_bot.py
-python3 scribd_bot.py
-```
-
----
-
-## 📊 Features Overview
-
-### ✅ What Works
-
-- ✅ Download Scribd documents as PDF
-- ✅ Convert to multiple formats (TXT, HTML)
-- ✅ Extract pages as images
-- ✅ Owner-only admin system
-- ✅ User management & authorization
-- ✅ Broadcast announcements
-- ✅ Real-time status updates with emojis
-- ✅ Async/Non-blocking architecture
-- ✅ Persistent user database (JSON)
-- ✅ Comprehensive error handling
-- ✅ Activity logging to file
-- ✅ Termux optimized
-- ✅ Memory efficient
-
-### ⚠️ Limitations
-
-- Image extraction limited to 50 pages (configurable)
-- Media group max 10 images per message
-- Some protected documents may fail
-- Requires stable internet connection
-
----
-
-## 🔐 Security Notes
-
-1. **Never share your BOT_TOKEN** - Keep it secret!
-2. **Never share your OWNER_ID** - It grants admin access
-3. **Bot users.json file** - Contains IDs of authorized users
-4. **Logs** - Check `scribd_bot.log` for issues (contains IDs)
-
----
-
-## 📝 Database File (bot_users.json)
-
-The bot automatically creates and maintains this file:
-
-```json
-{
-  "authorized_users": [
-    123456789,
-    987654321,
-    456789012
-  ],
-  "created_at": "2024-03-05T10:30:45.123456"
-}
-```
-
-You can manually edit this to add/remove users, but it's recommended to use bot commands instead.
-
----
-
-## 🔄 Keeping the Bot Running (Linux/VPS)
-
-### Using `screen` (Simple)
+#### Termux (Android)
 
 ```bash
-# Start in detached session
-screen -S scribd_bot -d -m python3 scribd_bot.py
-
-# Check if running
-screen -ls
-
-# Reattach to see logs
-screen -r scribd_bot
-
-# Detach without stopping (Ctrl+A then D)
+pkg update && pkg upgrade -y
+pkg install python libxml2 libxslt libjpeg-turbo
+pip install -r requirements.txt
 ```
 
-### Using `systemd` (Advanced)
+#### Any Platform
 
-Create `/etc/systemd/system/scribd_bot.service`:
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+### 5. Run the Bot
+
+```bash
+python bot.py
+```
+
+For permanent background operation on a VPS:
+
+```bash
+# Using screen
+screen -S docbot
+python bot.py
+# Ctrl+A then D to detach
+
+# Using nohup
+nohup python bot.py > bot.log 2>&1 &
+
+# Using systemd (production-grade)
+# See systemd section below
+```
+
+---
+
+## Telegram UI
+
+### Main Menu
+
+| Button | Action |
+|--------|--------|
+| 📥 Download Document | Prompts for a URL |
+| 📂 My Downloads | Paginated download history |
+| 📚 Extract Text | Text from last analysed URL |
+| 🌐 Website Snapshot | HTML file from last analysed URL |
+| ⚙️ Settings | Toggle auto-PDF, notifications |
+| ℹ️ Help | Usage guide |
+
+### After Sending a URL
+
+| Button | Output |
+|--------|--------|
+| ⬇ Download as PDF | Direct PDF or images→PDF |
+| 🖼 Download Images | ZIP of all page images |
+| 📄 Extract Text | Readable Markdown text |
+| 🌐 Save HTML | Full `.html` snapshot |
+| 📦 All Assets (ZIP) | Every PDF + image + doc bundled |
+
+---
+
+## Admin Commands
+
+All admin commands require your `OWNER_ID`.
+
+| Command | Description |
+|---------|-------------|
+| `/add_user <id>` | Grant a user access |
+| `/remove_user <id>` | Revoke a user's access |
+| `/users` | List all allowed users |
+| `/broadcast <msg>` | Send a message to every user |
+| `/admin_stats` | Bot-wide statistics |
+
+---
+
+## User Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Main menu |
+| `/help` | Usage guide |
+| `/history` | Last 50 downloads (paginated) |
+| `/stats` | Personal download statistics |
+| `/cancel` | Reset current session |
+
+---
+
+## File Structure
+
+```
+workspace/
+├── bot.py            ← Complete single-file bot (edit this)
+├── requirements.txt  ← Python dependencies
+├── SETUP_GUIDE.md    ← This file
+├── bot_data.db       ← SQLite database (auto-created on first run)
+├── bot.log           ← Log file (auto-created)
+└── tmp/              ← Temp download folder (auto-created, auto-cleaned)
+```
+
+---
+
+## Configuration Reference
+
+All tuneable constants live in the `§2 CONFIGURATION` block of `bot.py`:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `MAX_FILE_SIZE` | 50 MB | Telegram upload limit |
+| `MAX_IMAGES_PER_JOB` | 40 | Images converted per PDF job |
+| `MAX_ASSETS_PER_ZIP` | 30 | Assets per ZIP bundle |
+| `MAX_CONCURRENT_DL` | 5 | Global parallel download slots |
+| `MAX_QUEUE_PER_USER` | 3 | Downloads queued per user |
+| `RATE_LIMIT_CALLS` | 5 | Max requests per window |
+| `RATE_LIMIT_WINDOW_SEC` | 30 | Rate-limit sliding window |
+| `CACHE_TTL_SEC` | 3600 | URL analysis cache lifetime |
+| `MAX_RETRIES` | 3 | HTTP retry attempts |
+
+---
+
+## Systemd Service (Production VPS)
 
 ```ini
+# /etc/systemd/system/docbot.service
 [Unit]
-Description=Scribd Downloader Bot
+Description=Universal Document Downloader Bot
 After=network.target
 
 [Service]
 Type=simple
-User=youruser
-WorkingDirectory=/home/youruser
-ExecStart=/usr/bin/python3 /home/youruser/scribd_bot.py
+User=ubuntu
+WorkingDirectory=/workspace
+Environment="BOT_TOKEN=YOUR_TOKEN"
+Environment="OWNER_ID=YOUR_ID"
+ExecStart=/usr/bin/python3 /workspace/bot.py
 Restart=always
 RestartSec=10
 
@@ -303,118 +214,32 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Then:
-
 ```bash
-sudo systemctl enable scribd_bot
-sudo systemctl start scribd_bot
-sudo systemctl status scribd_bot
-```
-
-### Using `nohup` (Quick & Dirty)
-
-```bash
-nohup python3 scribd_bot.py > bot.log 2>&1 &
+sudo systemctl daemon-reload
+sudo systemctl enable docbot
+sudo systemctl start docbot
+sudo systemctl status docbot
 ```
 
 ---
 
-## 📈 Monitoring & Logs
+## Troubleshooting
 
-The bot creates `scribd_bot.log` with detailed logs:
-
+**`lxml` install fails on Termux**
 ```bash
-# Watch logs in real-time
-tail -f scribd_bot.log
-
-# Check for errors
-grep "❌" scribd_bot.log
-
-# See last 50 lines
-tail -50 scribd_bot.log
+pkg install libxml2 libxslt && pip install lxml
 ```
 
----
-
-## 🆘 Getting Help
-
-If the bot doesn't work:
-
-1. ✅ Check BOT_TOKEN is correct
-2. ✅ Check OWNER_ID is correct  
-3. ✅ Check all dependencies installed
-4. ✅ Check internet connection
-5. ✅ Check `scribd_bot.log` for errors
-6. ✅ Try restarting the bot
-7. ✅ Delete `bot_users.json` and restart (if corrupted)
-
----
-
-## 📜 License & Credits
-
-- **Framework:** python-telegram-bot v20+
-- **Async:** aiohttp, asyncio
-- **License:** MIT (Free to use, modify, distribute)
-- **Author:** AI Assistant
-
----
-
-## 🎯 Version Info
-
-- **Version:** 2.0
-- **Python:** 3.9+
-- **Last Updated:** 2024
-- **Status:** Production Ready ✅
-
----
-
-## 💡 Tips & Tricks
-
-### Tip 1: Add Multiple Users Quickly
-
+**`Pillow` fails**
 ```bash
-python3 -c "
-from scribd_bot import db
-for uid in [123, 456, 789]:
-    db.add_user(uid)
-"
+pkg install libjpeg-turbo && pip install Pillow --no-cache-dir
 ```
 
-### Tip 2: Backup User Data
+**Bot doesn't respond**
+- Check `bot.log` for errors.
+- Make sure `BOT_TOKEN` and `OWNER_ID` are set correctly.
+- Verify the bot isn't already running in another terminal.
 
-```bash
-cp bot_users.json bot_users.backup.json
-```
-
-### Tip 3: Clear Temp Files
-
-```bash
-rm -rf /tmp/scribd_bot/*
-```
-
-### Tip 4: Run on a Timer (Linux)
-
-```bash
-# Auto-restart daily
-(crontab -l 2>/dev/null; echo "0 0 * * * pkill -f scribd_bot.py; sleep 5; python3 /path/to/scribd_bot.py &") | crontab -
-```
-
----
-
-## ✨ Future Enhancements
-
-Potential features for future versions:
-
-- [ ] Database migration to SQLite for scalability
-- [ ] Cloud storage integration (Google Drive, Dropbox)
-- [ ] Document preview with inline viewers
-- [ ] Download history tracking
-- [ ] Rate limiting per user
-- [ ] Language selection
-- [ ] Premium tier for more downloads
-- [ ] Webhook support instead of polling
-- [ ] Admin dashboard/web panel
-
----
-
-**Happy downloading! 🚀📚**
+**File too large error**
+- Telegram limits uploads to 50 MB. Large PDFs must be split or compressed.
+- The bot skips assets that exceed this limit automatically.
